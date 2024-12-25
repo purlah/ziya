@@ -1,27 +1,48 @@
 import os
+import os.path
 from typing import List, Tuple, Set, Union
 
+import json
 import botocore
 import tiktoken
 from langchain.agents import AgentExecutor
 from langchain.agents.format_scratchpad import format_xml
 from langchain_aws import ChatBedrock
 from langchain_community.document_loaders import TextLoader
+from langchain_core.agents import AgentFinish
 from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel, Field
 
-from app.agents.prompts import conversational_prompt, parse_output
+from app.agents.prompts import conversational_prompt
+from app.utils.sanitizer_util import clean_backtick_sequences
+
 from app.utils.logging_utils import logger
 from app.utils.print_tree_util import print_file_tree
 
+def clean_chat_history(chat_history: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """Clean chat history by removing invalid messages and normalizing content."""
+    cleaned = []
+    for human, ai in chat_history:
+        # Skip pairs with empty messages
+        if not human or not human.strip() or not ai or not ai.strip():
+            logger.warning(f"Skipping invalid message pair: human='{human}', ai='{ai}'")
+            continue
+        cleaned.append((human.strip(), ai.strip()))
+    return cleaned
 
 def _format_chat_history(chat_history: List[Tuple[str, str]]) -> List[Union[HumanMessage, AIMessage]]:
-    logger.info("Formatting chat history")
+    logger.info(f"Formatting chat history: {json.dumps(chat_history, indent=2)}")
+    cleaned_history = clean_chat_history(chat_history)
     buffer = []
-    for human, ai in chat_history:
+    for human, ai in cleaned_history:
         buffer.append(HumanMessage(content=human))
         buffer.append(AIMessage(content=ai))
     return buffer
+
+def parse_output(message):
+    """Parse and sanitize the output from the language model."""
+    text = clean_backtick_sequences(message.content)
+    return AgentFinish(return_values={"output": text}, log=text)
 
 aws_profile = os.environ.get("ZIYA_AWS_PROFILE")
 if aws_profile:
@@ -49,11 +70,13 @@ model = ChatBedrock(
 
 def get_combined_docs_from_files(files) -> str:
     combined_contents: str = ""
+    logger.debug("Processing files:")
     print_file_tree(files)
     user_codebase_dir: str = os.environ["ZIYA_USER_CODEBASE_DIR"]
     for file_path in files:
         try:
             full_file_path = os.path.join(user_codebase_dir, file_path)
+            if os.path.isdir(full_file_path): continue  # Skip directories 
             docs = TextLoader(full_file_path).load()
             for doc in docs:
                 combined_contents += f"File: {file_path}\n{doc.page_content}\n\n"
@@ -71,6 +94,7 @@ def get_combined_docs_from_files(files) -> str:
 llm_with_stop = model.bind(stop=["</tool_input>"])
 
 def extract_codebase(x):
+    logger.debug(f"Extracting codebase for files: {x['config'].get('files', [])}")
     return get_combined_docs_from_files(x["config"].get("files", []))
 
 agent = (
