@@ -26,6 +26,9 @@ langchain-anthropic = ">=0.2,<0.3"
 langchain-cli = ">=0.0.15"
 pydevd-pycharm = "^243.18137.19"
 langchain-community = "^0.3.1"
+transformers = "^4.36.2"
+python-dotenv = ">=0.19.0"
+google-auth = ">=2.0.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.3"

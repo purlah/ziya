@@ -794,6 +794,11 @@ def parse_unified_diff_exact_plus(diff_content: str, target_file: str) -> list[d
             i += 1
             continue
 
+        # Handle index lines and other git metadata
+        if line.startswith('index ') or line.startswith('new file mode ') or line.startswith('deleted file mode '):
+            i += 1
+            continue
+
         if line.startswith('@@ '):
             close_hunk()
             match = re.match(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*$', line)
@@ -817,6 +822,7 @@ def parse_unified_diff_exact_plus(diff_content: str, target_file: str) -> list[d
                     'old_block': [],
                     'new_lines': []
                 }
+                logger.debug(f"Found hunk: {current_hunk}")
                 in_hunk = True
                 hunks.append(current_hunk)
             i += 1
@@ -824,12 +830,14 @@ def parse_unified_diff_exact_plus(diff_content: str, target_file: str) -> list[d
 
         if in_hunk and current_hunk:
             if line.startswith('-'):
-                text = line[1:].rstrip('\n')
+                text = line[1:].rstrip('\r\n')
                 current_hunk['old_block'].append(text)
             elif line.startswith('+'):
-                text = line[1:].rstrip('\n')
+                text = line[1:].rstrip('\r\n')
                 current_hunk['new_lines'].append(text)
             else:
+                if not line.strip():
+                    continue  # Skip empty lines between hunks
                 # context => belongs to both old_block & new_lines
                 text = line[1:].rstrip('\n') if line.startswith(' ') else line.rstrip('\n')
                 current_hunk['old_block'].append(text)

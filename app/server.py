@@ -12,6 +12,7 @@ from fastapi.templating import Jinja2Templates
 from langserve import add_routes
 from app.agents.agent import model
 from app.agents.agent import agent_executor
+from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from botocore.exceptions import ClientError, BotoCoreError, CredentialRetrievalError
@@ -99,6 +100,17 @@ async def general_exception_handler(request: Request, exc: Exception):
     error_message = str(exc)
     status_code = 500
     error_type = "unknown_error"
+    
+    # Check for Gemini token limit error
+    if isinstance(exc, ChatGoogleGenerativeAIError) and "token count" in error_message:
+        return JSONResponse(
+            status_code=413,
+            content={
+                "error": "validation_error",
+                "detail": "Selected content is too large for the model. Please reduce the number of files."
+            }
+        )
+
     try:
         # Check if this is a streaming error
         if isinstance(exc, EventStreamError):
@@ -161,6 +173,16 @@ async def stream_endpoint(body: dict):
                                 yield f"data: {json.dumps(error_msg)}\n\n"
                                 await response.flush()
                                 logger.info("Sent EventStreamError message: %s", error_msg)
+                                return
+                        except ChatGoogleGenerativeAIError as e:
+                            if "token count" in str(e):
+                                error_msg = {
+                                    "error": "validation_error",
+                                    "detail": "Selected content is too large for the model. Please reduce the number of files."
+                                }
+                                yield f"data: {json.dumps(error_msg)}\n\n"
+                                await response.flush()
+                                logger.info("Sent token limit error message: %s", error_msg)
                                 return
             except EventStreamError as e:
                 if "validationException" in str(e):
@@ -285,8 +307,12 @@ def get_default_included_folders():
 
 @app.get('/api/model-id')
 def get_model_id():
-    # Get the model ID from the configured Bedrock client
-    return {'model_id': model.model_id.split(':')[0].split('/')[-1]}
+    if os.environ.get("ZIYA_ENDPOINT") == "google":
+        model_name = os.environ.get("ZIYA_MODEL", "gemini-pro")
+        return {'model_id': model_name}
+    else:
+        # Bedrock
+        return {'model_id': model.model_id.split(':')[0].split('/')[-1]}
 
 class ApplyChangesRequest(BaseModel):
     diff: str

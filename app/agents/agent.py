@@ -9,6 +9,8 @@ import tiktoken
 from langchain.agents import AgentExecutor
 from langchain.agents.format_scratchpad import format_xml
 from langchain_aws import ChatBedrock
+from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError
+from google.api_core.exceptions import ResourceExhausted
 from langchain_community.document_loaders import TextLoader
 from langchain_core.agents import AgentFinish
 from langchain_core.messages import AIMessage, HumanMessage
@@ -17,6 +19,7 @@ from langchain_core.runnables import RunnablePassthrough, Runnable
 from pydantic import BaseModel, Field
 
 from app.agents.prompts import conversational_prompt
+from app.agents.models import ModelManager
 
 from app.utils.sanitizer_util import clean_backtick_sequences
 
@@ -59,8 +62,14 @@ def parse_output(message):
             content = str(message)
     finally:
         if content:
-            # Check if this is an error message
+            # If content is a method (from Gemini), get the actual content
+            if callable(content):
+                try:
+                    content = content()
+                except Exception as e:
+                    logger.error(f"Error calling content method: {e}")
             try:
+                # Check if this is an error message
                 error_data = json.loads(content)
                 if error_data.get('error') == 'validation_error':
                     logger.info(f"Detected validation error in output: {content}")
@@ -74,33 +83,8 @@ def parse_output(message):
             return AgentFinish(return_values={"output": text}, log=text)
         return AgentFinish(return_values={"output": ""}, log="")
 
-aws_profile = os.environ.get("ZIYA_AWS_PROFILE")
-if aws_profile:
-    logger.info(f"Using AWS Profile: {aws_profile}")
-else:
-    logger.info("No AWS profile specified via --aws-profile flag, using default credentials")
-model_id = {
-    "sonnet3.5": "us.anthropic.claude-3-5-sonnet-20240620-v1:0",
-    "sonnet3.5-v2": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
-    "opus": "us.anthropic.claude-3-opus-20240229-v1:0",
-    "sonnet": "us.anthropic.claude-3-sonnet-20240229-v1:0",
-    "haiku": "us.anthropic.claude-3-haiku-20240307-v1:0",
-}[os.environ.get("ZIYA_AWS_MODEL", "sonnet3.5-v2")]
-logger.info(f"Using Claude Model: {model_id}")
-    
-model = ChatBedrock(
-    model_id=model_id,
-    model_kwargs={"max_tokens": 4096, "temperature": 0.3, "top_k": 15},
-    credentials_profile_name=aws_profile if aws_profile else None,
-    config=botocore.config.Config( 
-        read_timeout=900, 
-        retries={ 
-            'max_attempts': 3, 
-            'total_max_attempts': 5 
-        } 
-        # retry_mode is not supported in this version
-    )
-)
+# Initialize the model using the ModelManager
+model = ModelManager.initialize_model()
 
 # Create a wrapper class that adds retries
 class RetryingChatBedrock(Runnable):
@@ -147,19 +131,51 @@ class RetryingChatBedrock(Runnable):
         max_retries = 3
         retry_delay = 1
 
+        # Handle non-retryable errors first
+        try:
+            # Check for token limit errors before attempting any retries
+            if isinstance(input, dict) and 'messages' in input:
+                try:
+                    tokens = self.model.get_num_tokens(str(input))
+                    if tokens > 30720:  # Gemini's limit
+                        logger.error(f"Token count {tokens} exceeds limit before retry")
+                        yield Generation(
+                            text=json.dumps({
+                                "error": "validation_error",
+                                "detail": "Selected content is too large for the model. Please reduce the number of files."
+                            })
+                        )
+                        return
+                except Exception as e:
+                    logger.warning(f"Failed to check tokens before stream: {e}")
+
+        except Exception as e:
+            logger.error(f"Error in pre-stream validation: {e}")
+
         for attempt in range(max_retries):
             try:
                 if stream_mode:
                     async for chunk in self.model.astream(input, config, **kwargs):
                         if isinstance(chunk, dict) and "error" in chunk:
                             yield Generation(text=json.dumps(chunk))
+                            if chunk.get("error") == "validation_error":
+                                return  # Don't retry validation errors
                         else:
                             yield chunk
                 else:
                     # Get complete response at once
                     result = await self.model.ainvoke(input, config, **kwargs)
                     yield result
-                break
+                break  # Success, exit retry loop
+            except ResourceExhausted as e:
+                logger.error(f"Google API quota exceeded: {str(e)}")
+                yield Generation(
+                    text=json.dumps({
+                        "error": "quota_exceeded",
+                        "detail": "API quota has been exceeded. Please try again in a few minutes."
+                    })
+                )
+                return  # Don't retry quota errors
             except (botocore.exceptions.EventStreamError, ExceptionGroup) as e:
                 error_message = str(e)
                 if "validationException" in str(e):
@@ -169,8 +185,27 @@ class RetryingChatBedrock(Runnable):
                         "detail": "Selected content is too large for the model. Please reduce the number of files."
                     }))
                     return
+            except ChatGoogleGenerativeAIError as e:
+                if "token count" in str(e):
+                    logger.error(f"Token limit exceeded on attempt {attempt + 1}: {str(e)}")
+                    yield Generation(
+                        text=json.dumps({
+                            "error": "validation_error",
+                            "detail": "Selected content is too large for the model. Please reduce the number of files."
+                        })
+                    )
+                    return  # Don't retry token limit errors
+                if attempt == max_retries - 1:
+                    raise  # Re-raise on last attempt
+                await asyncio.sleep(retry_delay * (attempt + 1))
+            except Exception as e:
+                logger.error(f"Attempt {attempt + 1} failed: {str(e)}")
+                if attempt == max_retries - 1:
+                    # On last attempt, yield error message instead of raising
+                    yield Generation(text=json.dumps({"error": "stream_error", "detail": str(e)}))
+                    return
+                await asyncio.sleep(retry_delay * (attempt + 1))
             raise e
-
 
 model = RetryingChatBedrock(model)
 
