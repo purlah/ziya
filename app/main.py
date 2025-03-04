@@ -18,10 +18,16 @@ def parse_arguments():
                         help="List of files or directories to exclude (e.g., --exclude 'tst,build,*.py')")
     parser.add_argument("--profile", type=str, default=None,
                         help="AWS profile to use (e.g., --profile ziya)")
-    parser.add_argument("--endpoint", type=str, choices=["bedrock", "google"], default="bedrock",
-                        help="Model endpoint to use (default: bedrock)")
+    # Get default endpoint and model aliases from configuration
+    default_endpoint = "bedrock"  # Fallback default
+    
+    # Get default model alias from ModelManager based on default endpoint
+    default_model = ModelManager.DEFAULT_MODELS[default_endpoint]
+    
+    parser.add_argument("--endpoint", type=str, choices=["bedrock", "google"], default=default_endpoint,
+                        help=f"Model endpoint to use (default: {default_endpoint})")
     parser.add_argument("--model", type=str, default=None,
-                        help="Model to use from selected endpoint.")
+                        help=f"Model to use from selected endpoint (default: {default_model})")
     parser.add_argument("--port", type=int, default=6969,
                         help="Port number to run Ziya frontend on (e.g., --port 8080)")
     parser.add_argument("--version", action="store_true",
@@ -115,13 +121,15 @@ def start_server(args):
     # This allows the server to be accessible from other machines on the network
     try:
         # Pre-initialize the model to catch any credential issues before starting the server
+        logger.info("Performing initial authentication check...")
         try:
             # Try to initialize the model before starting the server
             ModelManager.initialize_model()
+            logger.info("Authentication successful, starting server...")
             serve(host="0.0.0.0", port=args.port)
         except ValueError as e:
-            logger.error(str(e))
-            logger.error("\nServer startup aborted due to authentication error.")
+            logger.error(f"\n{str(e)}")
+            logger.error("Server startup aborted due to configuration error.")
             sys.exit(1)
     except ValueError as e:
         logger.error(f"\n{str(e)}")
@@ -132,7 +140,12 @@ def check_auth(args):
     """Check authentication setup without starting the server."""
     try:
         setup_environment(args)
-        model = ModelManager.initialize_model()
+        # Only initialize if not already done
+        if not ModelManager._state['auth_checked'] or ModelManager._state['process_id'] != os.getpid():
+            model = ModelManager.initialize_model()
+        elif not ModelManager._state['auth_success']:
+            logger.error("Previous authentication attempt failed")
+            return False
         logger.info("Authentication check successful!")
         return True
     except Exception as e:
