@@ -232,15 +232,16 @@ class ModelManager:
         logger.info(f"Initializing model for endpoint: {endpoint}, model: {model_name}")
         if endpoint == "bedrock":
             cls._state['model'] = cls._initialize_bedrock_model(model_name)
-#            cls._state['model'].model_id = model_name  # Ensure model ID matches what was requested
+            if model_name:
+                cls._state['model'].model_id = model_name
         elif endpoint == "google":
             cls._state['model'] = cls._initialize_google_model(model_name)
         else:
             raise ValueError(f"Unsupported endpoint: {endpoint}")
-
+            
         # Update process ID after successful initialization
             cls._state['process_id'] = current_pid
-            
+        
         return cls._state['model']
  
     @classmethod
@@ -259,7 +260,7 @@ class ModelManager:
         # Get custom settings if available
         temperature = float(os.environ.get("ZIYA_TEMPERATURE", config.get('temperature', 0.3)))
         top_k = int(os.environ.get("ZIYA_TOP_K", config.get('top_k', 15)))
-        max_output = int(os.environ.get("ZIYA_MAX_OUTPUT_TOKENS", max_output))
+        max_output = int(os.environ.get("ZIYA_MAX_OUTPUT_TOKENS", config.get('max_output_tokens', 4096)))
         
         logger.info(f"Initializing Bedrock model: {model_id} with max_tokens: {max_output}, "
                     f"temperature: {temperature}, top_k: {top_k}")

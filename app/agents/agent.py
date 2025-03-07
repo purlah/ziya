@@ -114,9 +114,6 @@ def parse_output(message):
             return AgentFinish(return_values={"output": text}, log=text)
         return AgentFinish(return_values={"output": ""}, log="")
 
-# Initialize the model using the ModelManager
-model = ModelManager.initialize_model().bind()
-
 # Create a wrapper class that adds retries
 class RetryingChatBedrock(Runnable):
     def __init__(self, model):
@@ -379,7 +376,8 @@ class RetryingChatBedrock(Runnable):
     async def ainvoke(self, input: Any, config: Optional[Dict] = None, **kwargs) -> Any:
         return await self.model.ainvoke(input, config, **kwargs)
 
-model = RetryingChatBedrock(model)
+# Initialize the model using the ModelManager
+model = RetryingChatBedrock(ModelManager.initialize_model())
 
 file_state_manager = FileStateManager()
 
