@@ -16,7 +16,7 @@ poetry run fbuild && poetry run python app/main.py --profile ziya --port 6868
 ```bash
 pip uninstall ziya -y
 python ./ziya_build.py
-pip install dist/
+pip install dist/*.whl
 ```
 
 #### To run unit tests for backend
