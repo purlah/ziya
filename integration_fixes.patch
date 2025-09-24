@@ -1,0 +1,1917 @@
+diff --git a/app/config/shell_config.py b/app/config/shell_config.py
+index 3308c13..15728bf 100644
+--- a/app/config/shell_config.py
++++ b/app/config/shell_config.py
+@@ -19,7 +19,7 @@ DEFAULT_SHELL_CONFIG = {
+         "ls-files", "ls-tree", "blame", "tag", "stash list", "reflog", 
+         "rev-parse", "describe", "shortlog", "whatchanged"
+     ],
+-    "timeout": 10
++    "timeout": 30
+ }
+ 
+ def get_default_shell_config():
+diff --git a/app/extensions/prompt_extensions/claude_extensions.py b/app/extensions/prompt_extensions/claude_extensions.py
+index c1ec863..23899c8 100644
+--- a/app/extensions/prompt_extensions/claude_extensions.py
++++ b/app/extensions/prompt_extensions/claude_extensions.py
+@@ -39,8 +39,21 @@ CLAUDE FAMILY INSTRUCTIONS:
+ 4. Use XML tags for structured outputs when appropriate
+ 5. Your job is not to proclaim the greatness of the user or the success of your efforts. You are being engaged, at each exchange, to solve a problem, not to congratulate yourself or the user. Look for the problem not the success.
+ 
++TOOL USAGE PRIORITIZATION:
++1. **Answer from available context first** - If information is available in the provided codebase, files, or conversation context, use that directly
++2. **Use reasoning and analysis** - Apply your knowledge and analytical capabilities before reaching for tools
++3. **Tools are secondary** - Only use tools when:
++   - Information cannot be determined from available context
++   - You need to perform an action (like running code, checking files, etc.)
++   - The user explicitly requests tool usage
++4. **Don't use tools unnecessarily** - Avoid tool usage for tasks you can complete through analysis of provided information
++
+ TOOL EXECUTION AND CONTINUATION:
+-When you need to use a tool:
++
++INTERNAL CONTEXT CHECK:
++Before using any tools, silently assess: "Do I already have the information needed in my provided context?" Only proceed with tools if the answer is clearly "no."
++
++When you have determined that a tool is necessary:
+ 1. Introduce what you're about to do
+ 2. Execute the tool call
+ 3. **STOP IMMEDIATELY after </TOOL_SENTINEL>** - DO NOT CONTINUE YOUR RESPONSE
+@@ -48,10 +61,10 @@ When you need to use a tool:
+ 5. **DO NOT** guess what the tool output will be
+ 6. **DO NOT** write "Based on the result..." or similar text
+ 7. **WAIT** for the actual tool result to be provided
+- 
+-After I provide the tool result, I will ask you to continue. Only then should you resume your response.
+- 
+-Example: "I'll check the current directory." [TOOL CALL] [STOP AND WAIT] [TOOL RESULT PROVIDED] "Based on the result, the current directory is..."
++
++CRITICAL: Use ONLY native tool calling. Never generate markdown like ```_command or ```bash. Use the provided tools directly.
++
++If the provided context doesn't fully answer the user's request, use tools to gather the missing information. When you find relevant files through exploration, examine their contents. Check that all the required parameters for each tool call are provided or can reasonably be inferred from context. IF there are no relevant tools or there are missing values for required parameters, ask the user to supply these values; otherwise proceed with the tool calls. If the user provides a specific value for a parameter (for example provided in quotes), make sure to use that value EXACTLY. DO NOT make up values for or ask about optional parameters. Carefully analyze descriptive terms in the request as they may indicate required parameter values that should be included even if not explicitly quoted.
+ """
+     
+     # Find a good place to insert the instructions
+diff --git a/app/extensions/prompt_extensions/mcp_prompt_extensions.py b/app/extensions/prompt_extensions/mcp_prompt_extensions.py
+index 7ed0532..fa2adde 100644
+--- a/app/extensions/prompt_extensions/mcp_prompt_extensions.py
++++ b/app/extensions/prompt_extensions/mcp_prompt_extensions.py
+@@ -69,14 +69,20 @@ def mcp_usage_guidelines(prompt: str, context: dict) -> str:
+     
+     # Check if MCP tools are available in the context
+     # This would be passed from the agent system when MCP is initialized
+-    mcp_tools_available = context.get("mcp_tools_available", False)
+-    from app.mcp.tools import create_mcp_tools
+-    all_mcp_tools = create_mcp_tools()
+-    available_tools = [tool.name for tool in all_mcp_tools]
++    # Get server-specific tools only (exclude MCPResourceTool which is always present)
++    try:
++        from app.mcp.manager import get_mcp_manager
++        mcp_manager = get_mcp_manager()
++        server_tools = mcp_manager.get_all_tools() if mcp_manager.is_initialized else []
++        available_tools = [f"mcp_{tool.name}" if not tool.name.startswith("mcp_") else tool.name for tool in server_tools]
++    except Exception as e:
++        logger.warning(f"Could not get MCP server tools: {e}")
++        available_tools = []
+     
+     if not available_tools:
+         logger.info("MCP_GUIDELINES: No MCP tools available or list is empty, returning original prompt.")
+         return prompt
++
+  
+     # For Google models, native function calling is used. Do not add XML tool instructions.
+     if is_google_endpoint:
+@@ -93,6 +99,19 @@ def mcp_usage_guidelines(prompt: str, context: dict) -> str:
+         # For other models (Bedrock, etc.), provide XML-based tool instructions
+         mcp_guidelines = """
+ 
++🚨 CRITICAL FILE MODIFICATION PROHIBITION 🚨
++═══════════════════════════════════════════════
++NEVER use tools to:
++- Copy files (cp, backup, etc.)
++- Modify files directly (sed, awk, etc.) 
++- Create new files
++- Move or rename files
++- Change file permissions
++
++ONLY suggest changes through Git diff patches in your response text.
++If you catch yourself about to modify a file with a tool - STOP and provide a diff instead.
++═══════════════════════════════════════════════
++
+ ## MCP Tool Usage - CRITICAL INSTRUCTIONS
+ **EXECUTE TOOLS WHEN REQUESTED - Never simulate or describe what you would do.**
+ 
+@@ -104,11 +123,30 @@ def mcp_usage_guidelines(prompt: str, context: dict) -> str:
+ **Usage Rules:**
+ 0. **Prefer local context and AST over tools when either can provide similar information**
+ 1. **Always use actual tool results** - Never fabricate output
++
++⚠️  BEFORE EVERY TOOL CALL ASK YOURSELF: ⚠️
++"Am I about to modify a file? If yes, I must provide a Git diff patch instead!"
+ 2. **Shell commands**: Use read-only commands (ls, cat, grep) when possible; format output as terminal session
+ 3. **Time queries**: Always use tool rather than guessing current time
+ 4. **Error handling**: Show actual errors and try alternatives
+ 5. **Verification**: Use tools to verify system state rather than making assumptions
+ 6. **No Empty Calls**: Do not generate empty or incomplete tool calls. Only output a tool call block if you have a valid command to execute.
++"""
++
++        # Add shell-specific warning if shell command tool is available
++        if any("shell" in tool.lower() or "run_shell_command" in tool for tool in available_tools):
++            mcp_guidelines += """
++
++🛑 SHELL COMMAND RESTRICTIONS 🛑
++Tools are for READING and ANALYZING code, not changing it.
++When using shell commands, stick to read-only operations like:
++- ls, find, grep, cat, head, tail, wc, du, df
++- git status, git log, git show, git diff
++
++PROHIBITED shell operations:
++- File modifications: cp, mv, rm, touch, mkdir, chmod, chown
++- Text editing: sed, awk with -i, nano, vim, echo >
++- System changes: sudo, su, systemctl, service
+ """
+ 
+     logger.info(f"MCP_GUIDELINES: Original prompt length: {len(prompt)}")
+@@ -118,13 +156,8 @@ def mcp_usage_guidelines(prompt: str, context: dict) -> str:
+     logger.info(f"MCP_GUIDELINES: Last 500 chars of modified prompt: ...{modified_prompt[-500:]}")
+     return modified_prompt
+ 
+-def _get_tool_description(tool_name: str) -> str:
+-    """Get a brief description of what an MCP tool is used for."""
+-    descriptions = {
+-        "mcp_get_current_time": "checking current system time and date",
+-        "mcp_run_shell_command": "executing safe shell commands to inspect system state", 
+-    }
+-    return descriptions.get(tool_name, "specialized system operations")
++# Removed _get_tool_description() function as it was hardcoding shell tool descriptions
++# even when shell server was disabled. Now we only show descriptions for actually enabled tools.
+ 
+ def _get_tool_descriptions_from_mcp(available_tools: list) -> str:
+     """Get tool descriptions from actual MCP tool definitions."""
+@@ -136,6 +169,7 @@ def _get_tool_descriptions_from_mcp(available_tools: list) -> str:
+         
+         if mcp_manager.is_initialized:
+             # Get all MCP tools with their descriptions
++            # This already filters by enabled servers only
+             mcp_tools = mcp_manager.get_all_tools()
+             tool_map = {tool.name: tool.description for tool in mcp_tools}
+             
+@@ -144,20 +178,23 @@ def _get_tool_descriptions_from_mcp(available_tools: list) -> str:
+                 clean_name = tool_name[4:] if tool_name.startswith("mcp_") else tool_name
+                 description = tool_map.get(clean_name, "Specialized system operations")
+                 
+-                display_name = f"mcp_{clean_name}" if not tool_name.startswith("mcp_") else tool_name
+-                tool_descriptions.append(f"- **{display_name}**: {description}")
++                # Only add description if the tool is actually available from enabled servers
++                if clean_name in tool_map:
++                    display_name = f"mcp_{clean_name}" if not tool_name.startswith("mcp_") else tool_name
++                    tool_descriptions.append(f"- **{display_name}**: {description}")
+         else:
+-            # Fallback if MCP manager not initialized
+-            for tool_name in available_tools:
+-                display_name = f"mcp_{tool_name}" if not tool_name.startswith("mcp_") else tool_name
+-                tool_descriptions.append(f"- **{display_name}**: Specialized system operations")
++            # If MCP manager not initialized, don't show any tool descriptions
++            logger.warning("MCP manager not initialized, no tool descriptions available")
++            return ""
+                 
+     except Exception as e:
+         logger.warning(f"Could not get MCP tool descriptions: {e}")
+-        # Fallback to generic descriptions
+-        for tool_name in available_tools:
+-            display_name = f"mcp_{tool_name}" if not tool_name.startswith("mcp_") else tool_name
+-            tool_descriptions.append(f"- **{display_name}**: Specialized system operations")
++        # Don't provide fallback descriptions - only show what's actually available
++        return ""
++    
++    if not tool_descriptions:
++        logger.info("No tool descriptions available from enabled servers")
++        return "No tools currently available."
+     
+     return "\n".join(tool_descriptions)
+ 
+@@ -170,7 +207,7 @@ def _get_tool_call_formats_from_mcp(available_tools: list) -> str:
+         if not mcp_manager.is_initialized:
+             return _get_fallback_tool_formats(available_tools)
+             
+-        # Get all MCP tools with their schemas
++        # Get all MCP tools with their schemas (already filters by enabled servers only)
+         mcp_tools = mcp_manager.get_all_tools()
+         tool_schemas = {tool.name: tool.inputSchema for tool in mcp_tools}
+         
+@@ -180,8 +217,9 @@ def _get_tool_call_formats_from_mcp(available_tools: list) -> str:
+             clean_name = tool_name[4:] if tool_name.startswith("mcp_") else tool_name
+             display_name = f"mcp_{clean_name}" if not tool_name.startswith("mcp_") else tool_name
+             
++            # Only generate format examples for tools that are actually available from enabled servers
+             schema = tool_schemas.get(clean_name)
+-            if schema and "properties" in schema:
++            if clean_name in tool_schemas and schema and "properties" in schema:
+                 # Generate example arguments from schema
+                 example_args = _generate_example_args_from_schema(schema, clean_name)
+                 
+@@ -196,11 +234,14 @@ def _get_tool_call_formats_from_mcp(available_tools: list) -> str:
+         if format_sections:
+             return "\n\n".join(format_sections)
+         else:
+-            return _get_fallback_tool_formats(available_tools)
++            # Don't use fallback formats - only show what's actually available
++            logger.info("No tool format examples available from enabled servers")
++            return "No tool formats currently available."
+             
+     except Exception as e:
+         logger.warning(f"Could not get MCP tool schemas: {e}")
+-        return _get_fallback_tool_formats(available_tools)
++        # Don't provide fallback formats - only show what's actually available
++        return ""
+  
+ def _generate_example_args_from_schema(schema: dict, tool_name: str) -> str:
+     """Generate example arguments JSON from tool schema."""
+@@ -246,30 +287,8 @@ def _get_example_value_for_property(prop_info: dict, prop_name: str, tool_name:
+     else:
+         return f"your_{prop_name}_here"
+  
+-def _get_fallback_tool_formats(available_tools: list) -> str:
+-    """Fallback tool format examples when schema info isn't available."""
+-    formats = []
+-    
+-    for tool_name in available_tools:
+-        clean_name = tool_name[4:] if tool_name.startswith("mcp_") else tool_name
+-        display_name = f"mcp_{clean_name}" if not tool_name.startswith("mcp_") else tool_name
+-        
+-        if clean_name == "run_shell_command":
+-            example_args = '{{"command": "ls -la"}}'
+-        elif clean_name == "get_current_time":
+-            example_args = '{{"format": "readable"}}'
+-        else:
+-            example_args = '{{"key": "value"}}'
+-            
+-        formats.append(f"""**{display_name} Format:**
+-```
+-{TOOL_SENTINEL_OPEN}
+-<name>{display_name}</name>
+-<arguments>{example_args}</arguments>
+-{TOOL_SENTINEL_CLOSE}
+-```""")
+-    
+-    return "\n\n".join(formats)
++# Removed _get_fallback_tool_formats() function as it was hardcoding shell tool examples
++# even when shell server was disabled. Now we only show formats for actually enabled tools.
+ 
+ def register_extensions(manager):
+     """
+diff --git a/app/mcp/client.py b/app/mcp/client.py
+index dea8323..da17a43 100644
+--- a/app/mcp/client.py
++++ b/app/mcp/client.py
+@@ -237,6 +237,9 @@ class MCPClient:
+     
+     async def _send_request(self, method: str, params: Optional[Dict[str, Any]] = None, _retry_count: int = 0) -> Optional[Dict[str, Any]]:
+         """Send a JSON-RPC request to the MCP server."""
++        import time
++        start_time = time.time()
++        
+         max_retries = 3
+         
+         if not self.process or not self.process.stdin:
+@@ -270,12 +273,18 @@ class MCPClient:
+             
+         try:
+             request_json = json.dumps(request) + "\n"
++            write_start = time.time()
+             self.process.stdin.write(request_json)
+             self.process.stdin.flush()
++            write_time = time.time() - write_start
++            logger.info(f"🔍 MCP_TIMING: Write took {write_time*1000:.1f}ms")
+             
+             # Read response
+             try:
++                read_start = time.time()
+                 response_line = self.process.stdout.readline()
++                read_time = time.time() - read_start
++                logger.info(f"🔍 MCP_TIMING: Read took {read_time*1000:.1f}ms")
+                 timeout_occurred = False
+             except Exception as e:
+                 logger.error(f"Error reading from MCP server: {e}")
+@@ -300,25 +309,23 @@ class MCPClient:
+             if "error" in response:
+                 error_info = response['error']
+                 error_code = error_info.get("code", -1)
+-                error_message = error_info.get("message", "Unknown MCP server error")
++                error_message = str(error_info.get("message", "Unknown error"))
+                 
+                 # Check if this is a timeout error and we haven't exhausted retries
+                 is_timeout = (error_code == -32603 and 
+                              ("timed out" in error_message.lower() or "timeout" in error_message.lower()))
+                 
+-                if is_timeout and _retry_count < max_retries:
+-                    logger.warning(f"MCP server timeout (attempt {_retry_count + 1}/{max_retries + 1}), retrying silently: {error_message}")
+-                    # Wait a brief moment before retry
++                # Timeouts should fail immediately to let the model choose a lighter alternative
++                if not is_timeout and _retry_count < max_retries:
++                    logger.error(f"MCP server error: {error_info}")
++                    # Only retry non-timeout errors
+                     await asyncio.sleep(0.5)
+                     return await self._send_request(method, params, _retry_count + 1)
+                 
+-                # Log error (only after retries exhausted for timeouts)
+-                if is_timeout:
+-                    logger.error(f"MCP server timeout after {max_retries + 1} attempts: {error_info}")
+-                else:
+-                    logger.error(f"MCP server error: {error_info}")
++                # Log all errors (timeouts fail immediately, others after retries)
++                logger.error(f"MCP server {'timeout' if is_timeout else 'error'}: {error_info}")
+                 
+-                # Return error information so it can be displayed to the user
++                # Create error result
+                 return {
+                     "error": True,
+                     "message": error_message,
+@@ -327,6 +334,8 @@ class MCPClient:
+                 
+             # Update successful call timestamp
+             self._last_successful_call = time.time()
++            total_time = time.time() - start_time
++            logger.info(f"🔍 MCP_TIMING: Total request took {total_time*1000:.1f}ms for method '{method}'")
+             return response.get("result")
+             
+         except Exception as e:
+diff --git a/app/mcp/manager.py b/app/mcp/manager.py
+index 5edbcee..b94c999 100644
+--- a/app/mcp/manager.py
++++ b/app/mcp/manager.py
+@@ -45,6 +45,11 @@ class MCPManager:
+         self._reconnection_attempts: Dict[str, float] = {}  # Track last reconnection attempt per server
+         self._failed_servers: set = set()  # Servers that have failed too many times
+         
++        # Loop detection for repetitive tool calls
++        self._recent_tool_calls: List[tuple] = []  # (tool_name, arguments, timestamp)
++        self._max_recent_calls = 10
++        self._loop_detection_window = 30  # seconds
++        
+     def _get_builtin_server_definitions(self) -> Dict[str, Dict[str, Any]]:
+         """Defines configurations for built-in MCP servers."""
+         builtin_servers = {}
+@@ -394,6 +399,8 @@ class MCPManager:
+             server_config = self.server_configs.get(server_name, {})
+             is_enabled = server_config.get("enabled", True)
+             
++            logger.info(f"MCP_MANAGER.get_all_tools: Server '{server_name}' - connected: {client.is_connected}, enabled: {is_enabled}")
++            
+             if client.is_connected and is_enabled:
+                 client_tools = client.tools
+                 logger.info(f"MCP_MANAGER.get_all_tools: Server '{server_name}' has {len(client_tools)} tools: {[t.name for t in client_tools]}")
+@@ -464,6 +471,30 @@ class MCPManager:
+                         return content
+         return None
+     
++    def _is_repetitive_call(self, tool_name: str, arguments: Dict[str, Any]) -> bool:
++        """Check if this tool call is repetitive within the detection window."""
++        current_time = time.time()
++        call_signature = (tool_name, str(arguments))
++        
++        # Clean old calls outside the window
++        self._recent_tool_calls = [
++            (name, args, timestamp) for name, args, timestamp in self._recent_tool_calls
++            if current_time - timestamp <= self._loop_detection_window
++        ]
++        
++        # Count identical calls in the window
++        identical_calls = sum(1 for name, args, _ in self._recent_tool_calls 
++                             if (name, args) == call_signature)
++        
++        # Add current call
++        self._recent_tool_calls.append((tool_name, str(arguments), current_time))
++        
++        # Keep only recent calls
++        if len(self._recent_tool_calls) > self._max_recent_calls:
++            self._recent_tool_calls = self._recent_tool_calls[-self._max_recent_calls:]
++        
++        return identical_calls >= 3  # Allow max 3 identical calls
++
+     async def call_tool(self, tool_name: str, arguments: Dict[str, Any], server_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+         """
+         Call an MCP tool.
+@@ -476,6 +507,11 @@ class MCPManager:
+         Returns:
+             Tool execution result or None if not found
+         """
++        # Check for repetitive calls
++        if self._is_repetitive_call(tool_name, arguments):
++            logger.warning(f"🔍 MCP_MANAGER: Blocking repetitive tool call: {tool_name} with {arguments}")
++            return {"content": [{"type": "text", "text": "Tool call blocked due to repetitive execution pattern"}]}
++        
+         # Remove mcp_ prefix if present for internal tool lookup
+         internal_tool_name = tool_name
+         if tool_name.startswith("mcp_"):
+diff --git a/app/mcp_servers/shell_server.py b/app/mcp_servers/shell_server.py
+index 2c162df..01490ab 100644
+--- a/app/mcp_servers/shell_server.py
++++ b/app/mcp_servers/shell_server.py
+@@ -191,7 +191,7 @@ class ShellServer:
+                                 "properties": {
+                                     "command": {
+                                         "type": "string",
+-                                        "description": "The shell command to execute"
++                                        "description": "A complete shell command with all required arguments (e.g., 'ls -la', 'grep pattern file', 'find . -name \"*.py\"'). Do not use incomplete commands like 'grep' alone."
+                                     },
+                                     "timeout": {
+                                         "type": "number",
+diff --git a/app/middleware/streaming.py b/app/middleware/streaming.py
+index cf86211..0d9efcb 100644
+--- a/app/middleware/streaming.py
++++ b/app/middleware/streaming.py
+@@ -146,6 +146,16 @@ class StreamingMiddleware(BaseHTTPMiddleware):
+                                 # If it's not valid JSON, just pass it as a string
+                                 content = str(chunk)
+                                 
++                                # Immediately pass through tool_start messages without buffering
++                                if '"type": "tool_start"' in content:
++                                    # First flush any buffered content
++                                    if content_buffer:
++                                        yield f"data: {json.dumps({'content': content_buffer})}\n\n"
++                                        content_buffer = ""
++                                    # Then send the tool_start message
++                                    yield content
++                                    continue
++                                
+                                 # Buffer content to check for tool calls
+                                 content_buffer += content
+                                 
+@@ -247,6 +257,16 @@ class StreamingMiddleware(BaseHTTPMiddleware):
+                             # For simple string content
+                             content = str(raw_content)
+                             
++                            # Immediately pass through tool_start messages without buffering
++                            if '"type": "tool_start"' in content:
++                                # First flush any buffered content
++                                if content_buffer:
++                                    yield f"data: {json.dumps({'content': content_buffer})}\n\n"
++                                    content_buffer = ""
++                                # Then send the tool_start message
++                                yield content
++                                continue
++                            
+                             # Buffer content to check for tool calls
+                             content_buffer += content
+                             
+diff --git a/app/routes/mcp_routes.py b/app/routes/mcp_routes.py
+index 6584530..5140dd7 100644
+--- a/app/routes/mcp_routes.py
++++ b/app/routes/mcp_routes.py
+@@ -313,9 +313,13 @@ async def get_shell_config():
+             }
+         else:
+             # Shell server not connected, return default config with enabled=False
++            # But still check for environment timeout override
++            default_config = get_default_shell_config()
++            timeout = int(os.environ.get("COMMAND_TIMEOUT", default_config["timeout"]))
+             return {
+-                **get_default_shell_config(),
+-                "enabled": False
++                **default_config,
++                "enabled": False,
++                "timeout": timeout
+             }
+         
+     except Exception as e:
+@@ -347,7 +351,7 @@ async def update_shell_config(config: ShellConfig):
+         
+         # Create new shell server configuration
+         new_shell_config = {
+-            "command": ["python", "-u", "mcp_servers/shell_server.py"],
++            "command": ["python", "-u", "app/mcp_servers/shell_server.py"],
+             "enabled": config.enabled,
+             "env": {
+                 "ALLOW_COMMANDS": ",".join(config.allowedCommands),
+@@ -358,6 +362,9 @@ async def update_shell_config(config: ShellConfig):
+         }
+         
+         if config.enabled:
++            # Update the server configuration in MCP manager before restarting
++            mcp_manager.server_configs["shell"] = new_shell_config
++            
+             # Restart the shell server with new configuration
+             logger.info(f"Attempting to restart shell server with config: {new_shell_config}")
+             success = await mcp_manager.restart_server("shell", new_shell_config)
+diff --git a/app/server.py b/app/server.py
+index 3e1be55..d1ef7b8 100644
+--- a/app/server.py
++++ b/app/server.py
+@@ -146,7 +146,9 @@ def build_messages_for_streaming(question: str, chat_history: List, files: List,
+             from app.mcp.manager import get_mcp_manager
+             mcp_manager = get_mcp_manager()
+             if mcp_manager.is_initialized:
+-                tools_list = [f"- {tool.name}: {tool.description}" for tool in mcp_manager.get_all_tools()]
++                all_tools = mcp_manager.get_all_tools()
++                tools_list = [f"- {tool.name}: {tool.description}" for tool in all_tools]
++                logger.info(f"🔍 SYSTEM_PROMPT_TOOLS: Including {len(all_tools)} tools in system prompt: {[t.name for t in all_tools]}")
+         except Exception as e:
+             logger.warning(f"Could not get tools for template: {e}")
+     else:
+@@ -1233,6 +1235,11 @@ async def stream_chunks(body):
+                         logger.info(f"🔍 TOOL_CHUNK: tool_name={chunk.get('tool_name')}, result_size={len(chunk.get('result', ''))}")
+                 
+                 yield sse_data
++                
++                # Force immediate delivery for tool results
++                if chunk.get('type') == 'tool_execution':
++                    import sys
++                    sys.stdout.flush()
+             
+             yield "data: [DONE]\n\n"
+             return
+diff --git a/app/streaming_tool_executor.py b/app/streaming_tool_executor.py
+index 458fd93..58f31d9 100644
+--- a/app/streaming_tool_executor.py
++++ b/app/streaming_tool_executor.py
+@@ -3,6 +3,8 @@ import asyncio
+ import json
+ import boto3
+ import logging
++import os
++import time
+ from typing import Dict, Any, List, AsyncGenerator, Optional
+ 
+ logger = logging.getLogger(__name__)
+@@ -144,6 +146,7 @@ class StreamingToolExecutor:
+         for iteration in range(50):  # Increased from 20 to support more complex tasks
+             logger.info(f"🔍 ITERATION_START: Beginning iteration {iteration}")
+             tools_executed_this_iteration = False  # Track if tools were executed in this iteration
++            blocked_tools_this_iteration = 0  # Track blocked tools to prevent runaway loops
+             
+             body = {
+                 "anthropic_version": "bedrock-2023-05-31",
+@@ -164,6 +167,8 @@ class StreamingToolExecutor:
+                 # Remove markdown tool patterns that cause hallucinations
+                 system_content = re.sub(r'```tool:.*?```', '', system_content, flags=re.DOTALL)
+                 system_content = re.sub(r'```.*?mcp_.*?```', '', system_content, flags=re.DOTALL)
++                # Remove only MCP tools list, not visualization tools
++                system_content = re.sub(r'- mcp_[^:]+:[^\n]*\n?', '', system_content)
+                 body["system"] = system_content + "\n\nCRITICAL: Use ONLY native tool calling. Never generate markdown like ```tool:mcp_run_shell_command or ```bash. Use the provided tools directly."
+ 
+             if bedrock_tools:
+@@ -175,6 +180,7 @@ class StreamingToolExecutor:
+                 # Exponential backoff for rate limiting
+                 max_retries = 4
+                 base_delay = 2  # Start with 2 seconds
++                iteration_start_time = time.time()
+                 
+                 for retry_attempt in range(max_retries + 1):
+                     try:
+@@ -209,10 +215,10 @@ class StreamingToolExecutor:
+                 skipped_tools = set()  # Track tools we're skipping due to limits
+                 executed_tool_signatures = set()  # Track tool name + args to prevent duplicates
+                 
+-                # Timeout protection
+-                import time
++                # Timeout protection - use configured timeout from shell config
+                 start_time = time.time()
+-                chunk_timeout = 30
++                from app.config.shell_config import DEFAULT_SHELL_CONFIG
++                chunk_timeout = int(os.environ.get('COMMAND_TIMEOUT', DEFAULT_SHELL_CONFIG["timeout"]))
+ 
+                 for event in response['body']:
+                     # Timeout protection
+@@ -238,6 +244,8 @@ class StreamingToolExecutor:
+                                 })
+                                 logger.info(f"🔍 COLLECTED_TOOL: {tool_name} (id: {tool_id})")
+                                 
++
++                                
+                                 active_tools[tool_id] = {
+                                     'name': tool_name,
+                                     'partial_json': '',
+@@ -257,14 +265,16 @@ class StreamingToolExecutor:
+                             assistant_text += text
+                             
+                             # Check for fake tool calls in the text and intercept them
+-                            if ('```tool:' in assistant_text or 'run_shell_command\n$' in assistant_text or 
+-                                ':mcp_run_shell_command\n$' in assistant_text):
++                            # DISABLED: This was causing premature execution of incomplete commands
++                            if False and (('```tool:' in assistant_text and '```' in assistant_text[assistant_text.find('```tool:') + 8:]) or \
++                               ('run_shell_command\n$' in assistant_text and '\n' in assistant_text[assistant_text.find('run_shell_command\n$') + 20:]) or \
++                               (':mcp_run_shell_command\n$' in assistant_text and '\n' in assistant_text[assistant_text.find(':mcp_run_shell_command\n$') + 23:])):
+                                 # Extract and execute fake tool calls with multiple patterns
+                                 import re
+                                 patterns = [
+-                                    r'```tool:(mcp_\w+)\n\$\s*([^`]+)```',  # Full markdown blocks
+-                                    r'run_shell_command\n\$\s*([^\n]+)',    # Partial patterns
+-                                    r':mcp_run_shell_command\n\$\s*([^\n]+)' # Alternative patterns
++                                    r'```tool:(mcp_\w+)\n\$\s*([^`]+)```',  # Full markdown blocks only
++                                    r'run_shell_command\n\$\s*([^\n]+)\n',    # Complete lines only
++                                    r':mcp_run_shell_command\n\$\s*([^\n]+)\n' # Complete lines only
+                                 ]
+                                 
+                                 for pattern in patterns:
+@@ -280,11 +290,20 @@ class StreamingToolExecutor:
+                                             result = await self._execute_fake_tool('mcp_run_shell_command', command, assistant_text, tool_results, mcp_manager)
+                                             if result:
+                                                 yield result
+-                            
+-                            # Only yield text if it doesn't contain fake tool calls
+-                            if not ('```tool:' in text):
+-                                yield {'type': 'text', 'content': text}
+-                                yielded_text_length += len(text)  # Track yielded text
++                                
++                                for pattern in patterns:
++                                    if re.search(pattern, text):
++                                        logger.warning(f"🚫 Intercepted fake tool call: {pattern}")
++                            if 'tool:' in text:
++                                # Skip fake tool patterns
++                                continue
++                                
++                            yield {
++                                'type': 'text', 
++                                'content': text,
++                                'timestamp': f"{int((time.time() - iteration_start_time) * 1000)}ms"
++                            }
++                            yielded_text_length += len(text)  # Track yielded text
+                         elif delta.get('type') == 'input_json_delta':
+                             # Find tool by index
+                             tool_id = None
+@@ -330,6 +349,7 @@ class StreamingToolExecutor:
+                                 if tool_signature in executed_tool_signatures:
+                                     logger.info(f"🔍 DUPLICATE_TOOL_SKIP: Skipping duplicate {actual_tool_name} with args {args}")
+                                     completed_tools.add(tool_id)
++                                    blocked_tools_this_iteration += 1
+                                     continue
+                                 
+                                 # For shell commands, check for similar recent commands
+@@ -343,6 +363,7 @@ class StreamingToolExecutor:
+                                         if self._commands_similar(normalized_cmd, recent_cmd):
+                                             logger.info(f"🔍 SIMILAR_COMMAND_SKIP: Skipping similar command: {command}")
+                                             completed_tools.add(tool_id)
++                                            blocked_tools_this_iteration += 1
+                                             # Skip this tool entirely - don't execute it
+                                             break
+                                     else:
+@@ -354,13 +375,29 @@ class StreamingToolExecutor:
+                                         
+                                         executed_tool_signatures.add(tool_signature)
+                                         
++                                        # Send tool_start event with complete arguments
++                                        yield {
++                                            'type': 'tool_start',
++                                            'tool_id': tool_id,
++                                            'tool_name': tool_name,
++                                            'args': args,
++                                            'timestamp': f"{int((time.time() - iteration_start_time) * 1000)}ms"
++                                        }
++                                        
+                                         # Execute the tool only if it's not similar to recent commands
+                                         result = await mcp_manager.call_tool(actual_tool_name, args)
+ 
+-                                        if isinstance(result, dict) and 'content' in result:
++                                        # Check if result contains an error or was blocked
++                                        if isinstance(result, dict) and result.get('error'):
++                                            error_msg = result.get('message', 'Unknown error')
++                                            result_text = f"ERROR: {error_msg}. Please try a different approach or fix the command."
++                                        elif isinstance(result, dict) and 'content' in result:
+                                             content = result['content']
+                                             if isinstance(content, list) and len(content) > 0:
+                                                 result_text = content[0].get('text', str(result))
++                                                # Check if this was a blocked repetitive call
++                                                if 'blocked' in result_text.lower() or len(result_text) < 100:
++                                                    blocked_tools_this_iteration += 1
+                                             else:
+                                                 result_text = str(result)
+                                         else:
+@@ -376,7 +413,8 @@ class StreamingToolExecutor:
+                                             'type': 'tool_execution',
+                                             'tool_id': tool_id,
+                                             'tool_name': tool_name,
+-                                            'result': result_text
++                                            'result': result_text,
++                                            'timestamp': f"{int((time.time() - iteration_start_time) * 1000)}ms"
+                                         }
+                                         
+                                         tools_executed_this_iteration = True  # Mark that tools were executed
+@@ -384,6 +422,14 @@ class StreamingToolExecutor:
+ 
+                             except Exception as e:
+                                 error_msg = f"Tool error: {str(e)}"
++                                
++                                # Add error to tool_results so it gets fed back to the model
++                                tool_results.append({
++                                    'tool_id': tool_id,
++                                    'tool_name': tool_name,
++                                    'result': f"ERROR: {error_msg}. Please try a different approach or fix the command."
++                                })
++                                
+                                 yield {'type': 'error', 'content': error_msg}
+ 
+                     elif chunk['type'] == 'message_stop':
+@@ -415,11 +461,26 @@ class StreamingToolExecutor:
+                     logger.info(f"🔍 CONTINUING_ITERATION: Moving to iteration {iteration + 1} to let model respond to tool results")
+                     continue
+                 else:
+-                    # No tools executed - end the stream
+-                    if assistant_text.strip():
+-                        logger.info(f"🔍 STREAM_END: Model produced text without tools, ending stream")
++                    # Check if too many tools were blocked (indicates runaway loop)
++                    if blocked_tools_this_iteration >= 3:
++                        logger.warning(f"🔍 RUNAWAY_LOOP_DETECTED: {blocked_tools_this_iteration} tools blocked in iteration {iteration}, ending stream")
+                         yield {'type': 'stream_end'}
+                         break
++                    
++                    # No tools executed - check if we should end the stream
++                    if assistant_text.strip():
++                        # Check if the text suggests the model is about to make a tool call
++                        # Only check the last 200 characters to avoid issues with long accumulated text
++                        text_end = assistant_text[-200:].lower().strip()
++                        suggests_tool_call = text_end.endswith(':')
++                        
++                        if suggests_tool_call and iteration < 3:  # More conservative limit
++                            logger.info(f"🔍 POTENTIAL_TOOL_CALL: Text suggests model wants to make a tool call, continuing: '{assistant_text[-50:]}'")
++                            continue
++                        else:
++                            logger.info(f"🔍 STREAM_END: Model produced text without tools, ending stream")
++                            yield {'type': 'stream_end'}
++                            break
+                     elif iteration >= 2:  # Safety: end after 2 failed iterations
+                         yield {'type': 'stream_end'}
+                         break
+diff --git a/frontend/src/apis/chatApi.ts b/frontend/src/apis/chatApi.ts
+index e982fc4..a9a3017 100644
+--- a/frontend/src/apis/chatApi.ts
++++ b/frontend/src/apis/chatApi.ts
+@@ -418,7 +418,7 @@ export const sendPayload = async (
+         const decoder = new TextDecoder();
+ 
+         // Process chunks as they arrive
+-        function processChunk(chunk: string) {
++        const processChunk = (chunk: string) => {
+             // Split the chunk by newlines to handle multiple SSE events
+             const lines = chunk.split('\n');
+ 
+@@ -692,453 +692,501 @@ export const sendPayload = async (
+                             }
+ 
+                             // Format as tool block that shows the tool is starting
+-                            const toolStartDisplay = `\n\`\`\`tool:${toolName}\n⏳ Running: ${inputDisplay}\n\`\`\`\n\n`;
++                            let toolStartDisplay;
++                            if (toolName === 'mcp_run_shell_command' && jsonData.args && jsonData.args.command) {
++                                // For shell commands, show the actual command being executed
++                                toolStartDisplay = `\n\`\`\`tool:${toolName}\n⏳ Running: $ ${jsonData.args.command}\n\`\`\`\n\n`;
++                            } else if (toolName === 'mcp_run_shell_command' && jsonData.input && typeof jsonData.input === 'object' && jsonData.input.command) {
++                                // Handle alternative input format
++                                toolStartDisplay = `\n\`\`\`tool:${toolName}\n⏳ Running: $ ${jsonData.input.command}\n\`\`\`\n\n`;
++                            }
+ 
+-                            console.log('🔧 TOOL_START formatted:', toolStartDisplay);
+-                            currentContent += toolStartDisplay;
+-                            console.log('🔧 CURRENT_CONTENT after tool_start:', currentContent.slice(-200));
+-                            setStreamedContentMap((prev: Map<string, string>) => {
+-                                const next = new Map(prev);
+-                                next.set(conversationId, currentContent);
+-                                return next;
+-                            });
+-                        } else if (jsonData.type === 'tool_execution') {
+-                            // Handle structured tool execution using existing ToolBlock syntax
+-                            console.log('🔧 TOOL_EXECUTION received:', jsonData);
+-                            const signedIndicator = jsonData.signed ? ' 🔒' : '';
++                        console.log('🔧 TOOL_START formatted:', toolStartDisplay);
++                        currentContent += toolStartDisplay;
++                        console.log('🔧 CURRENT_CONTENT after tool_start:', currentContent.slice(-200));
++                        setStreamedContentMap((prev: Map<string, string>) => {
++                            const next = new Map(prev);
++                            next.set(conversationId, currentContent);
++                            return next;
++                        });
++                    } else if (jsonData.type === 'tool_start') {
++                        // Handle tool start events
++                        console.log('🔧 TOOL_START received:', jsonData);
+ 
+-                            // Normalize tool name - ensure single mcp_ prefix
+-                            let toolName = jsonData.tool_name;
+-                            if (!toolName.startsWith('mcp_')) {
+-                                toolName = `mcp_${toolName}`;
+-                            }
+-                            // Remove any double prefixes
+-                            toolName = toolName.replace(/^mcp_mcp_/, 'mcp_');
++                        // Log timestamp for debugging
++                        if (jsonData.timestamp) {
++                            console.log(`[${jsonData.timestamp}] TOOL_START: ${jsonData.tool_name}`);
++                        }
+ 
+-                            // Extract result - handle both string and object formats
+-                            let result = jsonData.result;
+-                            if (typeof result === 'string' && result.startsWith('{')) {
+-                                try {
+-                                    const parsed = JSON.parse(result);
+-                                    if (parsed.error && parsed.message) {
+-                                        result = parsed.message;
+-                                    }
+-                                } catch (e) {
+-                                    // Keep original result if parsing fails
+-                                }
+-                            }
++                        const toolStartContent = `\n\n🔧 **Executing Tool**: \`${jsonData.tool_name}\`\n\n`;
++                        currentContent += toolStartContent;
++                        setStreamedContentMap((prev: Map<string, string>) => {
++                            const next = new Map(prev);
++                            next.set(conversationId, currentContent);
++                            return next;
++                        });
++                    } else if (jsonData.type === 'tool_execution') {
++                        // Handle structured tool execution using existing ToolBlock syntax
++                        console.log('🔧 TOOL_EXECUTION received:', jsonData);
++                        const signedIndicator = jsonData.signed ? ' 🔒' : '';
+ 
+-                            // Format as tool block that the MarkdownRenderer will recognize and style properly
+-                            const toolDisplay = `\n\`\`\`tool:${toolName}${signedIndicator}\n${result}\n\`\`\`\n\n`;
++                        // Normalize tool name - ensure single mcp_ prefix
+ 
+-                            console.log('🔧 TOOL_DISPLAY formatted:', toolDisplay);
++                        // Log timestamp for debugging
++                        if (jsonData.timestamp) {
++                            console.log(`[${jsonData.timestamp}] TOOL_EXECUTION: ${jsonData.tool_name}`);
++                        }
++                        let toolName = jsonData.tool_name;
++                        if (!toolName.startsWith('mcp_')) {
++                            toolName = `mcp_${toolName}`;
++                        }
++                        // Remove any double prefixes
++                        toolName = toolName.replace(/^mcp_mcp_/, 'mcp_');
++
++                        // Extract result - handle both string and object formats
++                        let result = jsonData.result;
++                        if (typeof result === 'string' && result.startsWith('{')) {
++                            try {
++                                const parsed = JSON.parse(result);
++                                if (parsed.error && parsed.message) {
++                                    result = parsed.message;
++                                }
++                            } catch (e) {
++                                // Keep original result if parsing fails
++                            }
++                        }
+ 
+-                            // Replace the corresponding tool_start block if it exists
+-                            const toolStartPattern = new RegExp(`\\n\`\`\`tool:${toolName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n⏳ Running:.*?\\n\`\`\`\\n\\n`, 'g');
+-                            if (toolStartPattern.test(currentContent)) {
++                        // Format as tool block that the MarkdownRenderer will recognize and style properly
++                        const toolDisplay = `\n\`\`\`tool:${toolName}${signedIndicator}\n${result}\n\`\`\`\n\n`;
++
++                        console.log('🔧 TOOL_DISPLAY formatted:', toolDisplay);
++
++                        // Replace the corresponding tool_start block if it exists
++                        const toolStartPattern = new RegExp(`\\n\`\`\`tool:${toolName}\\n⏳ Running: \\$ ([^\\n]+)\\n\`\`\`\\n\\n`, 'g');
++                        const toolStartMatch = currentContent.match(toolStartPattern);
++                        
++                        if (toolStartMatch) {
++                            // Extract the command from the match
++                            const commandMatch = toolStartMatch[0].match(/⏳ Running: \$ ([^\n]+)/);
++                            const command = commandMatch ? commandMatch[1] : '';
++                            
++                            // Check if result contains an error
++                            const isError = result.toLowerCase().includes('error') || 
++                                          result.toLowerCase().includes('failed') ||
++                                          result.toLowerCase().includes('command not found') ||
++                                          result.toLowerCase().includes('permission denied');
++                            
++                            if (isError && command) {
++                                // For errors, preserve the command and add the error result
++                                const errorDisplay = `\n\`\`\`tool:${toolName}${signedIndicator}\n⏳ Attempted: $ ${command}\n\n${result}\n\`\`\`\n\n`;
++                                currentContent = currentContent.replace(toolStartPattern, errorDisplay);
++                                console.log('🔧 TOOL_EXECUTION: Replaced tool_start with error (preserved command)');
++                            } else {
++                                // For success, replace with just the result
+                                 currentContent = currentContent.replace(toolStartPattern, toolDisplay);
+                                 console.log('🔧 TOOL_EXECUTION: Replaced tool_start block with result');
+-                            } else {
+-                                currentContent += toolDisplay;
+-                                console.log('🔧 TOOL_EXECUTION: Added new tool block (no matching tool_start found)');
+                             }
++                        } else {
++                            currentContent += toolDisplay;
++                            console.log('🔧 TOOL_EXECUTION: Added new tool block (no matching tool_start found)');
++                        }
+ 
+-                            console.log('🔧 CURRENT_CONTENT after tool:', currentContent.slice(-200));
+-                            setStreamedContentMap((prev: Map<string, string>) => {
++                    console.log('🔧 CURRENT_CONTENT after tool:', currentContent.slice(-200));
++                    setStreamedContentMap((prev: Map<string, string>) => {
++                        const next = new Map(prev);
++                        next.set(conversationId, currentContent);
++                        return next;
++                    });
++                }
++
++                // Process operations if present
++                const ops = jsonData.ops || [];
++                for (const op of ops) {
++                    if (op.op === 'add' && op.path === '/processing_state' && typeof setProcessingState === 'function') {
++                        // Handle processing state updates
++                        const stateValue = op.value;
++                        if (stateValue === 'awaiting_model_response') {
++                            setProcessingState('processing_tools');
++                        }
++                        // Note: State will auto-reset to 'idle' when removeStreamingConversation is called
++                        continue;
++                    }
++                    if (op.op === 'add' && op.path.endsWith('/reasoning_content/-')) {
++                        // Handle reasoning content separately
++                        const reasoningContent = op.value || '';
++                        if (reasoningContent && setReasoningContentMap) {
++                            console.log('ChatAPI: Adding reasoning content:', reasoningContent);
++                            setReasoningContentMap((prev: Map<string, string>) => {
+                                 const next = new Map(prev);
+-                                next.set(conversationId, currentContent);
++                                const existing = next.get(conversationId) || '';
++                                next.set(conversationId, existing + reasoningContent);
+                                 return next;
+                             });
+                         }
+-
+-                        // Process operations if present
+-                        const ops = jsonData.ops || [];
+-                        for (const op of ops) {
+-                            if (op.op === 'add' && op.path === '/processing_state' && typeof setProcessingState === 'function') {
+-                                // Handle processing state updates
+-                                const stateValue = op.value;
+-                                if (stateValue === 'awaiting_model_response') {
+-                                    setProcessingState('processing_tools');
+-                                }
+-                                // Note: State will auto-reset to 'idle' when removeStreamingConversation is called
+-                                continue;
+-                            }
+-                            if (op.op === 'add' && op.path.endsWith('/reasoning_content/-')) {
+-                                // Handle reasoning content separately
+-                                const reasoningContent = op.value || '';
+-                                if (reasoningContent && setReasoningContentMap) {
+-                                    console.log('ChatAPI: Adding reasoning content:', reasoningContent);
+-                                    setReasoningContentMap((prev: Map<string, string>) => {
+-                                        const next = new Map(prev);
+-                                        const existing = next.get(conversationId) || '';
+-                                        next.set(conversationId, existing + reasoningContent);
+-                                        return next;
+-                                    });
+-                                }
+-                                continue;
+-                            }
+-                            if (op.op === 'add' && op.path.endsWith('/streamed_output_str/-')) {
+-                                let newContent = op.value || '';
+-                                if (!newContent) continue;
+-
+-                                // Handle new Bedrock format with content= wrapper
+-                                if (typeof newContent === 'string' && newContent.includes('content=')) {
+-                                    // More robust extraction for various formats:
+-                                    // content='text' additional_kwargs={} response_metadata={}
+-                                    // content="text" additional_kwargs={} response_metadata={}
+-
+-                                    let extractedContent = '';
+-
+-                                    // Try single quotes first
+-                                    let match = newContent.match(/content='([^']*(?:\\.[^']*)*)'(?:\s+additional_kwargs=.*)?$/);
++                        continue;
++                    }
++                    if (op.op === 'add' && op.path.endsWith('/streamed_output_str/-')) {
++                        let newContent = op.value || '';
++                        if (!newContent) continue;
++
++                        // Handle new Bedrock format with content= wrapper
++                        if (typeof newContent === 'string' && newContent.includes('content=')) {
++                            // More robust extraction for various formats:
++                            // content='text' additional_kwargs={} response_metadata={}
++                            // content="text" additional_kwargs={} response_metadata={}
++
++                            let extractedContent = '';
++
++                            // Try single quotes first
++                            let match = newContent.match(/content='([^']*(?:\\.[^']*)*)'(?:\s+additional_kwargs=.*)?$/);
++                            if (match) {
++                                extractedContent = match[1];
++                            } else {
++                                // Try double quotes
++                                match = newContent.match(/content="([^"]*(?:\\.[^"]*)*)"(?:\s+additional_kwargs=.*)?$/);
++                                if (match) {
++                                    extractedContent = match[1];
++                                } else {
++                                    // Fallback: extract anything between quotes after content=
++                                    match = newContent.match(/content=['"]([^'"]*)['"]/);
+                                     if (match) {
+                                         extractedContent = match[1];
+                                     } else {
+-                                        // Try double quotes
+-                                        match = newContent.match(/content="([^"]*(?:\\.[^"]*)*)"(?:\s+additional_kwargs=.*)?$/);
+-                                        if (match) {
+-                                            extractedContent = match[1];
+-                                        } else {
+-                                            // Fallback: extract anything between quotes after content=
+-                                            match = newContent.match(/content=['"]([^'"]*)['"]/);
+-                                            if (match) {
+-                                                extractedContent = match[1];
+-                                            } else {
+-                                                // Last resort: use original content
+-                                                extractedContent = newContent;
+-                                            }
+-                                        }
++                                        // Last resort: use original content
++                                        extractedContent = newContent;
+                                     }
+-
+-                                    // Unescape common escape sequences
+-                                    newContent = extractedContent
+-                                        .replace(/\\'/g, "'")
+-                                        .replace(/\\"/g, '"')
+-                                        .replace(/\\n/g, '\n')
+-                                        .replace(/\\t/g, '\t')
+-                                        .replace(/\\r/g, '\r')
+-                                        .replace(/\\\\/g, '\\');
+                                 }
++                            }
+ 
+-                                currentContent += newContent;
+-                                setStreamedContentMap((prev: Map<string, string>) => {
+-                                    const next = new Map(prev);
+-                                    next.set(conversationId, currentContent);
+-                                    return next;
+-                                });
+-                            } else if (op.op === 'add' && op.path.includes('/streamed_output/-')) {
+-                                // Check for error in messages array - but be careful not to match code examples
+-                                if (op.value && op.value.messages && Array.isArray(op.value.messages)) {
+-                                    for (const msg of op.value.messages) {
+-                                        if (msg.content && typeof msg.content === 'string') {
+-                                            // Check if this message contains diff syntax and set the flag
+-                                            if (!containsDiff && (
+-                                                msg.content.includes('```diff') || msg.content.includes('diff --git') ||
+-                                                msg.content.match(/^@@ /m) || msg.content.match(/^\+\+\+ /m) || msg.content.match(/^--- /m))) {
+-                                                containsDiff = true;
+-                                                console.log("Detected diff content in message, disabling error detection");
+-                                            }
+-
+-                                            // Skip error checking if the message contains tool execution results
+-                                            const containsCodeBlock = msg.content.includes('```');
+-                                            const containsToolExecution = msg.content.includes('tool_execution') || msg.content.includes('⟩') || msg.content.includes('⟨');
+-                                            const errorResponse = (containsCodeBlock || containsDiff || containsToolExecution) ? null : extractErrorFromSSE(msg.content);
+-
+-                                            if (errorResponse) {
+-                                                console.log("Error detected in message content:", errorResponse);
+-                                                message.error({
+-                                                    content: errorResponse.detail || 'An error occurred',
+-                                                    duration: errorResponse.status_code === 429 ? 15 : 10,
+-                                                    key: `stream-error-${conversationId}`
+-                                                });
+-                                                message.warning({
+-                                                    content: `${errorResponse.detail || 'An error occurred'} (Partial response preserved - ${currentContent.length} characters)`,
+-                                                    duration: 15,
+-                                                    key: 'stream-error'
+-                                                });
+-                                                errorOccurred = true;
+-
+-                                                // Preserve partial content before removing stream
+-                                                if (currentContent && currentContent.trim()) {
+-                                                    const partialMessage: Message = {
+-                                                        role: 'assistant',
+-                                                        content: currentContent + '\n\n[Response interrupted: ' + (errorResponse.detail || 'An error occurred') + ']'
+-                                                    };
+-                                                    addMessageToConversation(partialMessage, conversationId, !isStreamingToCurrentConversation);
+-                                                }
+-
+-                                                // Clean up
+-                                                setIsStreaming(false);
+-                                                removeStreamingConversation(conversationId);
+-                                                setStreamedContentMap((prev: Map<string, string>) => new Map(prev));
+-                                                break;
+-                                            }
++                            // Unescape common escape sequences
++                            newContent = extractedContent
++                                .replace(/\\'/g, "'")
++                                .replace(/\\"/g, '"')
++                                .replace(/\\n/g, '\n')
++                                .replace(/\\t/g, '\t')
++                                .replace(/\\r/g, '\r')
++                                .replace(/\\\\/g, '\\');
++                        }
++
++                        currentContent += newContent;
++                        setStreamedContentMap((prev: Map<string, string>) => {
++                            const next = new Map(prev);
++                            next.set(conversationId, currentContent);
++                            return next;
++                        });
++                    } else if (op.op === 'add' && op.path.includes('/streamed_output/-')) {
++                        // Check for error in messages array - but be careful not to match code examples
++                        if (op.value && op.value.messages && Array.isArray(op.value.messages)) {
++                            for (const msg of op.value.messages) {
++                                if (msg.content && typeof msg.content === 'string') {
++                                    // Check if this message contains diff syntax and set the flag
++                                    if (!containsDiff && (
++                                        msg.content.includes('```diff') || msg.content.includes('diff --git') ||
++                                        msg.content.match(/^@@ /m) || msg.content.match(/^\+\+\+ /m) || msg.content.match(/^--- /m))) {
++                                        containsDiff = true;
++                                        console.log("Detected diff content in message, disabling error detection");
++                                    }
++
++                                    // Skip error checking if the message contains tool execution results
++                                    const containsCodeBlock = msg.content.includes('```');
++                                    const containsToolExecution = msg.content.includes('tool_execution') || msg.content.includes('⟩') || msg.content.includes('⟨');
++                                    const errorResponse = (containsCodeBlock || containsDiff || containsToolExecution) ? null : extractErrorFromSSE(msg.content);
++
++                                    if (errorResponse) {
++                                        console.log("Error detected in message content:", errorResponse);
++                                        message.error({
++                                            content: errorResponse.detail || 'An error occurred',
++                                            duration: errorResponse.status_code === 429 ? 15 : 10,
++                                            key: `stream-error-${conversationId}`
++                                        });
++                                        message.warning({
++                                            content: `${errorResponse.detail || 'An error occurred'} (Partial response preserved - ${currentContent.length} characters)`,
++                                            duration: 15,
++                                            key: 'stream-error'
++                                        });
++                                        errorOccurred = true;
++
++                                        // Preserve partial content before removing stream
++                                        if (currentContent && currentContent.trim()) {
++                                            const partialMessage: Message = {
++                                                role: 'assistant',
++                                                content: currentContent + '\n\n[Response interrupted: ' + (errorResponse.detail || 'An error occurred') + ']'
++                                            };
++                                            addMessageToConversation(partialMessage, conversationId, !isStreamingToCurrentConversation);
+                                         }
++
++                                        // Clean up
++                                        setIsStreaming(false);
++                                        removeStreamingConversation(conversationId);
++                                        setStreamedContentMap((prev: Map<string, string>) => new Map(prev));
++                                        break;
+                                     }
+                                 }
+                             }
+                         }
+-                    } catch (error) {
+-                        const e = error as Error;
+-                        console.error('Error parsing JSON chunk:', { error: e, rawData: data });
+-                        console.error('Error parsing JSON:', e);
+                     }
+                 }
++            } catch (error) {
++                const e = error as Error;
++                console.error('Error parsing JSON chunk:', { error: e, rawData: data });
++                console.error('Error parsing JSON:', e);
+             }
+         }
++    }
++        }
+ 
+-        async function readStream() {
++const readStream = async () => {
++    try {
++        while (true) {
+             try {
+-                while (true) {
+-                    try {
+-                        if (signal.aborted) {
+-                            console.log("Stream aborted by user");
+-                            errorOccurred = true;
+-                            removeStreamingConversation(conversationId);
+-                            setIsStreaming(false);
+-                            return 'Response generation stopped by user.';
+-                        }
+-                        const { done, value } = await reader.read();
+-                        if (done) {
+-                            console.log("Stream read complete (done=true)");
+-                            // If the stream was aborted, don't process the final content
+-                            if (isAborted) {
+-                                console.log("Stream was aborted, discarding final content");
++                if (signal.aborted) {
++                    console.log("Stream aborted by user");
++                    errorOccurred = true;
++                    removeStreamingConversation(conversationId);
++                    setIsStreaming(false);
++                    return 'Response generation stopped by user.';
++                }
++                const { done, value } = await reader.read();
++                if (done) {
++                    console.log("Stream read complete (done=true)");
++                    // If the stream was aborted, don't process the final content
++                    if (isAborted) {
++                        console.log("Stream was aborted, discarding final content");
++                        removeStreamingConversation(conversationId);
++                        return 'Response generation stopped by user.';
++                    }
++                    break;
++                }
++                if (errorOccurred) {
++                    console.log("Stream read aborted due to error");
++                    break;
++                }
++                const chunk = decoder.decode(value);
++                if (!chunk) {
++                    // Check if the stream was aborted during processing
++                    if (isAborted) {
++                        console.log("Stream was aborted during processing, discarding chunk");
++                        removeStreamingConversation(conversationId);
++                        setIsStreaming(false);
++                        return 'Response generation stopped by user.';
++                    }
++                    console.log("Empty chunk received, continuing");
++                    continue;
++                }
++
++                // Check if this chunk contains diff syntax and set the flag
++                if (!containsDiff && (
++                    chunk.includes('```diff') || chunk.includes('diff --git') ||
++                    chunk.match(/^@@ /m) || chunk.match(/^\+\+\+ /m) || chunk.match(/^--- /m))) {
++                    containsDiff = true;
++                    console.log("Detected diff content in chunk, disabling error detection");
++                }
++
++                // Check for errors using our new function - but be careful with code blocks
++                try {
++                    // Skip error checking if the chunk contains code blocks or diffs
++                    const containsCodeBlock = chunk.includes('```');
++
++                    if (!containsCodeBlock && !containsDiff) {
++                        // Check for nested errors in LangChain ops structure
++                        const nestedError = extractErrorFromNestedOps(chunk);
++                        if (nestedError) {
++                            console.log("Nested error detected in ops structure:", nestedError);
++
++                            // Show different message for partial responses vs complete failures
++                            const isPartialResponse = currentContent.length > 0;
++                            const errorMessage = isPartialResponse
++                                ? `${nestedError.detail} (Partial response preserved - ${currentContent.length} characters)`
++                                : nestedError.detail || 'An error occurred';
++
++                            // Dispatch preserved content event before showing error
++                            if (isPartialResponse && currentContent.length > 0) {
++                                document.dispatchEvent(new CustomEvent('preservedContent', {
++                                    detail: {
++                                        existing_streamed_content: currentContent,
++                                        error_detail: nestedError.detail || 'An error occurred during processing'
++                                    }
++                                }));
++                                // Don't remove streaming conversation here - let preserved content handler do it
++                            } else if (currentContent && currentContent.length > 0) {
++                                // Save partial content even without the preserved content event
++                                const partialMessage: Message = {
++                                    role: 'assistant',
++                                    content: currentContent + '\n\n[Response interrupted: ' + (nestedError.detail || 'An error occurred during processing') + ']'
++                                };
++                                addMessageToConversation(partialMessage, conversationId, !isStreamingToCurrentConversation);
++                                console.log('Saved partial content directly:', currentContent.length, 'characters');
+                                 removeStreamingConversation(conversationId);
+-                                return 'Response generation stopped by user.';
+                             }
+-                            break;
+-                        }
+-                        if (errorOccurred) {
+-                            console.log("Stream read aborted due to error");
+-                            break;
+-                        }
+-                        const chunk = decoder.decode(value);
+-                        if (!chunk) {
+-                            // Check if the stream was aborted during processing
+-                            if (isAborted) {
+-                                console.log("Stream was aborted during processing, discarding chunk");
++                            else {
++                                // No partial content to save
+                                 removeStreamingConversation(conversationId);
+-                                setIsStreaming(false);
+-                                return 'Response generation stopped by user.';
+                             }
+-                            console.log("Empty chunk received, continuing");
+-                            continue;
+-                        }
+ 
+-                        // Check if this chunk contains diff syntax and set the flag
+-                        if (!containsDiff && (
+-                            chunk.includes('```diff') || chunk.includes('diff --git') ||
+-                            chunk.match(/^@@ /m) || chunk.match(/^\+\+\+ /m) || chunk.match(/^--- /m))) {
+-                            containsDiff = true;
+-                            console.log("Detected diff content in chunk, disabling error detection");
+-                        }
+-
+-                        // Check for errors using our new function - but be careful with code blocks
+-                        try {
+-                            // Skip error checking if the chunk contains code blocks or diffs
+-                            const containsCodeBlock = chunk.includes('```');
+-
+-                            if (!containsCodeBlock && !containsDiff) {
+-                                // Check for nested errors in LangChain ops structure
+-                                const nestedError = extractErrorFromNestedOps(chunk);
+-                                if (nestedError) {
+-                                    console.log("Nested error detected in ops structure:", nestedError);
+-
+-                                    // Show different message for partial responses vs complete failures
+-                                    const isPartialResponse = currentContent.length > 0;
+-                                    const errorMessage = isPartialResponse
+-                                        ? `${nestedError.detail} (Partial response preserved - ${currentContent.length} characters)`
+-                                        : nestedError.detail || 'An error occurred';
+-
+-                                    // Dispatch preserved content event before showing error
+-                                    if (isPartialResponse && currentContent.length > 0) {
+-                                        document.dispatchEvent(new CustomEvent('preservedContent', {
+-                                            detail: {
+-                                                existing_streamed_content: currentContent,
+-                                                error_detail: nestedError.detail || 'An error occurred during processing'
+-                                            }
+-                                        }));
+-                                        // Don't remove streaming conversation here - let preserved content handler do it
+-                                    } else if (currentContent && currentContent.length > 0) {
+-                                        // Save partial content even without the preserved content event
+-                                        const partialMessage: Message = {
+-                                            role: 'assistant',
+-                                            content: currentContent + '\n\n[Response interrupted: ' + (nestedError.detail || 'An error occurred during processing') + ']'
+-                                        };
+-                                        addMessageToConversation(partialMessage, conversationId, !isStreamingToCurrentConversation);
+-                                        console.log('Saved partial content directly:', currentContent.length, 'characters');
+-                                        removeStreamingConversation(conversationId);
+-                                    }
+-                                    else {
+-                                        // No partial content to save
+-                                        removeStreamingConversation(conversationId);
+-                                    }
+-
+-                                    const messageType = isPartialResponse ? 'warning' : 'error';
+-                                    message[messageType]({
+-                                        content: errorMessage,
+-                                        duration: isPartialResponse ? 15 : 10,
+-                                        key: `stream-error-${conversationId}`
+-                                    });
+-                                    errorOccurred = true;
+-                                    break;
+-                                }
+-                            }
+-                        } catch (error) {
+-                            console.warn("Error checking for nested errors:", error);
++                            const messageType = isPartialResponse ? 'warning' : 'error';
++                            message[messageType]({
++                                content: errorMessage,
++                                duration: isPartialResponse ? 15 : 10,
++                                key: `stream-error-${conversationId}`
++                            });
++                            errorOccurred = true;
++                            break;
+                         }
+-
+-                        processChunk(chunk);
+-                    } catch (error) {
+-                        console.error('Error reading stream:', error);
+-                        message.error('Stream reading error. Check JS console for details.');
+-                        errorOccurred = true;
+-                        removeStreamingConversation(conversationId);
+-                        setIsStreaming(false);
+-                        break;
+                     }
++                } catch (error) {
++                    console.warn("Error checking for nested errors:", error);
+                 }
++
++                processChunk(chunk);
+             } catch (error) {
+-                if (error instanceof DOMException && error.name === 'AbortError') return '';
+-                console.error('Unhandled Stream error in readStream:', { error });
++                console.error('Error reading stream:', error);
++                message.error('Stream reading error. Check JS console for details.');
++                errorOccurred = true;
+                 removeStreamingConversation(conversationId);
+                 setIsStreaming(false);
+-                throw error;
+-            } finally {
+-                setIsStreaming(false);
+-                return !errorOccurred && currentContent ? currentContent : '';
++                break;
+             }
+         }
++    } catch (error) {
++        if (error instanceof DOMException && error.name === 'AbortError') return '';
++        console.error('Unhandled Stream error in readStream:', { error });
++        removeStreamingConversation(conversationId);
++        setIsStreaming(false);
++        throw error;
++    } finally {
++        setIsStreaming(false);
++        return !errorOccurred && currentContent ? currentContent : '';
++    }
++}
+ 
+-        try {
+-            console.log("Starting stream read...");
+-            const result = await readStream();
+-            // After successful streaming, update with final content
+-            if (currentContent && !errorOccurred) {
+-                console.log("Stream completed successfully");
+-
+-                // Check if the stream was aborted before adding the message
+-                if (isAborted) {
+-                    console.log("Stream was aborted, not adding final message");
+-                    removeStreamingConversation(conversationId);
+-                    return 'Response generation stopped by user.';
+-                }
++try {
++    console.log("Starting stream read...");
++    const result = await readStream();
++    // After successful streaming, update with final content
++    if (currentContent && !errorOccurred) {
++        console.log("Stream completed successfully");
+ 
+-                // Check if the stream was aborted before adding the message
+-                if (isAborted) {
+-                    console.log("Stream was aborted, not adding final message");
+-                    removeStreamingConversation(conversationId);
+-                    return 'Response generation stopped by user.';
+-                }
+-                // Check if the content is an error message using our new function
+-                // Skip error checking if the content contains tool execution results
+-                const containsCodeBlock = currentContent.includes('```');
+-                const containsToolExecution = currentContent.includes('tool_execution') || currentContent.includes('⟩') || currentContent.includes('⟨');
+-                const errorResponse = (containsCodeBlock || containsDiff || containsToolExecution) ? null : extractErrorFromSSE(currentContent);
+-
+-                if (errorResponse) {
+-                    console.log("Error detected in final content:", errorResponse);
+-
+-                    const isPartialResponse = currentContent.length > 0;
+-
+-                    // Dispatch preserved content event before showing error and removing stream
+-                    if (isPartialResponse) {
+-                        document.dispatchEvent(new CustomEvent('preservedContent', {
+-                            detail: {
+-                                existing_streamed_content: currentContent,
+-                                error_detail: errorResponse.detail || 'An error occurred during processing'
+-                            }
+-                        }));
++        // Check if the stream was aborted before adding the message
++        if (isAborted) {
++            console.log("Stream was aborted, not adding final message");
++            removeStreamingConversation(conversationId);
++            return 'Response generation stopped by user.';
++        }
++
++        // Check if the stream was aborted before adding the message
++        if (isAborted) {
++            console.log("Stream was aborted, not adding final message");
++            removeStreamingConversation(conversationId);
++            return 'Response generation stopped by user.';
++        }
++        // Check if the content is an error message using our new function
++        // Skip error checking if the content contains tool execution results
++        const containsCodeBlock = currentContent.includes('```');
++        const containsToolExecution = currentContent.includes('tool_execution') || currentContent.includes('⟩') || currentContent.includes('⟨');
++        const errorResponse = (containsCodeBlock || containsDiff || containsToolExecution) ? null : extractErrorFromSSE(currentContent);
++
++        if (errorResponse) {
++            console.log("Error detected in final content:", errorResponse);
++
++            const isPartialResponse = currentContent.length > 0;
++
++            // Dispatch preserved content event before showing error and removing stream
++            if (isPartialResponse) {
++                document.dispatchEvent(new CustomEvent('preservedContent', {
++                    detail: {
++                        existing_streamed_content: currentContent,
++                        error_detail: errorResponse.detail || 'An error occurred during processing'
+                     }
++                }));
++            }
+ 
+-                    const errorMessage = isPartialResponse
+-                        ? `${errorResponse.detail} (Partial response preserved - ${currentContent.length} characters)`
+-                        : errorResponse.detail || 'An error occurred';
++            const errorMessage = isPartialResponse
++                ? `${errorResponse.detail} (Partial response preserved - ${currentContent.length} characters)`
++                : errorResponse.detail || 'An error occurred';
+ 
+-                    const messageType = isPartialResponse ? 'warning' : 'error';
+-                    message[messageType]({
+-                        content: errorMessage,
+-                        duration: isPartialResponse ? 15 : 10,
+-                        key: `stream-error-${conversationId}`
+-                    });
+-                    errorOccurred = true;
+-                    removeStreamingConversation(conversationId);
++            const messageType = isPartialResponse ? 'warning' : 'error';
++            message[messageType]({
++                content: errorMessage,
++                duration: isPartialResponse ? 15 : 10,
++                key: `stream-error-${conversationId}`
++            });
++            errorOccurred = true;
++            removeStreamingConversation(conversationId);
+ 
+-                    // Still return the partial content so it can be used
+-                    return currentContent || '';
+-                }
++            // Still return the partial content so it can be used
++            return currentContent || '';
++        }
+ 
+-                // Even if we detect an error in the final content, save what we have
+-                if (errorOccurred && currentContent && currentContent.trim()) {
+-                    const partialMessage: Message = {
+-                        role: 'assistant',
+-                        content: currentContent
+-                    };
++        // Even if we detect an error in the final content, save what we have
++        if (errorOccurred && currentContent && currentContent.trim()) {
++            const partialMessage: Message = {
++                role: 'assistant',
++                content: currentContent
++            };
+ 
+-                    const isNonCurrentConversation = !isStreamingToCurrentConversation;
+-                    addMessageToConversation(partialMessage, conversationId, isNonCurrentConversation);
+-                    removeStreamingConversation(conversationId);
+-                    console.log('Saved partial content on error:', currentContent.length, 'characters');
+-                    return currentContent;
+-                }
++            const isNonCurrentConversation = !isStreamingToCurrentConversation;
++            addMessageToConversation(partialMessage, conversationId, isNonCurrentConversation);
++            removeStreamingConversation(conversationId);
++            console.log('Saved partial content on error:', currentContent.length, 'characters');
++            return currentContent;
++        }
+ 
+-                // Create a message object for the AI response
+-                const aiMessage: Message = {
+-                    role: 'assistant',
+-                    content: currentContent
+-                };
++        // Create a message object for the AI response
++        const aiMessage: Message = {
++            role: 'assistant',
++            content: currentContent
++        };
+ 
+-                const isNonCurrentConversation = !isStreamingToCurrentConversation;
+-                addMessageToConversation(aiMessage, conversationId, isNonCurrentConversation);
+-                removeStreamingConversation(conversationId);
+-            }
+-            return result;
++        const isNonCurrentConversation = !isStreamingToCurrentConversation;
++        addMessageToConversation(aiMessage, conversationId, isNonCurrentConversation);
++        removeStreamingConversation(conversationId);
++    }
++    return result;
+ 
+-        } catch (error) {
+-            // Type guard for DOMException
+-            if (error instanceof DOMException && error.name === 'AbortError') {
+-                console.log('Request was aborted');
+-                return 'Response generation stopped by user.';
+-            }
+-            if (error instanceof DOMException && error.name === 'AbortError') return '';
++} catch (error) {
++    // Type guard for DOMException
++    if (error instanceof DOMException && error.name === 'AbortError') {
++        console.log('Request was aborted');
++        return 'Response generation stopped by user.';
++    }
++    if (error instanceof DOMException && error.name === 'AbortError') return '';
+ 
+-            console.error('Stream processing error in readStream catch block:', { error });
+-            removeStreamingConversation(conversationId);
+-            setIsStreaming(false);
+-            throw error;
+-        } finally {
+-            setIsStreaming(false);
+-            return !errorOccurred && currentContent ? currentContent : '';
++    console.error('Stream processing error in readStream catch block:', { error });
++    removeStreamingConversation(conversationId);
++    setIsStreaming(false);
++    throw error;
++} finally {
++    setIsStreaming(false);
++    return !errorOccurred && currentContent ? currentContent : '';
+ 
+-        }
++}
+     } catch (error) {
+-        console.error('Error in sendPayload:', error);
+-        // Check for abort error
+-        if (error instanceof DOMException && error.name === 'AbortError') {
+-            return 'Response generation stopped by user.';
+-        }
+-        // Type guard for Error objects
+-        if (error instanceof Error) {
+-            console.error('Error details:', {
+-                name: error.name,
+-                message: error.message,
+-                stack: error.stack
+-            });
+-            message.error(`Error: ${error.message}`);
+-        }
+-        if (eventSource && typeof eventSource.close === 'function') eventSource.close();
+-        // Clear streaming state
+-        setIsStreaming(false);
+-        removeStreamingConversation(conversationId);
+-        throw error;
+-    } finally {
+-        if (eventSource && typeof eventSource.close === 'function') eventSource.close();
+-        document.removeEventListener('abortStream', abortListener as EventListener);
+-        setIsStreaming(false);
+-        removeStreamingConversation(conversationId);
+-        return '';
++    console.error('Error in sendPayload:', error);
++    // Check for abort error
++    if (error instanceof DOMException && error.name === 'AbortError') {
++        return 'Response generation stopped by user.';
+     }
++    // Type guard for Error objects
++    if (error instanceof Error) {
++        console.error('Error details:', {
++            name: error.name,
++            message: error.message,
++            stack: error.stack
++        });
++        message.error(`Error: ${error.message}`);
++    }
++    if (eventSource && typeof eventSource.close === 'function') eventSource.close();
++    // Clear streaming state
++    setIsStreaming(false);
++    removeStreamingConversation(conversationId);
++    throw error;
++} finally {
++    if (eventSource && typeof eventSource.close === 'function') eventSource.close();
++    document.removeEventListener('abortStream', abortListener as EventListener);
++    setIsStreaming(false);
++    removeStreamingConversation(conversationId);
++    return '';
++}
+ };
+ 
+ async function getApiResponse(messages: any[], question: string, checkedItems: string[], conversationId: string, signal?: AbortSignal) {
+diff --git a/frontend/src/components/App.tsx b/frontend/src/components/App.tsx
+index 32a098d..3f0bee5 100644
+--- a/frontend/src/components/App.tsx
++++ b/frontend/src/components/App.tsx
+@@ -1,4 +1,4 @@
+-import React, { useState, useRef, useEffect, Suspense } from 'react';
++import React, { useState, useRef, useEffect, useLayoutEffect, Suspense } from 'react';
+ import { FolderTree } from './FolderTree';
+ import { SendChatContainer } from './SendChatContainer';
+ import { StreamedContent } from './StreamedContent';
+@@ -110,6 +110,8 @@ export const App: React.FC = () => {
+         const saved = localStorage.getItem(PANEL_WIDTH_KEY);
+         return saved ? parseInt(saved, 10) : 300; // Default width: 300px
+     });
++    const scrollPreservationRef = useRef<{ position: number; wasAtBottom: boolean }>({ position: 0, wasAtBottom: false });
++    const isRenderingRef = useRef(false);
+     const bottomUpContentRef = useRef<HTMLDivElement | null>(null);
+     const chatContainerRef = useRef<HTMLDivElement | null>(null);
+ 
+@@ -201,18 +203,64 @@ export const App: React.FC = () => {
+         };
+ 
+         chatContainer.addEventListener('scroll', handleScroll, { passive: true });
+-
++        
+         return () => {
+             chatContainer.removeEventListener('scroll', handleScroll);
+             clearTimeout(scrollTimeout);
+         };
+     }, [userHasScrolled, setUserHasScrolled]);
+ 
++    // Preserve scroll position during re-renders
++    useLayoutEffect(() => {
++        const chatContainer = chatContainerRef.current || document.querySelector('.chat-container') as HTMLElement;
++        if (!chatContainer) return;
++
++        // Before render: capture current position
++        const { scrollTop, scrollHeight, clientHeight } = chatContainer;
++        const wasAtBottom = Math.abs(scrollHeight - scrollTop - clientHeight) < 20;
++        
++        scrollPreservationRef.current = {
++            position: scrollTop,
++            wasAtBottom
++        };
++        
++        isRenderingRef.current = true;
++        
++        // After render: restore appropriate position
++        return () => {
++            if (!isRenderingRef.current) return;
++            
++            requestAnimationFrame(() => {
++                const { wasAtBottom, position } = scrollPreservationRef.current;
++                
++                if (isTopToBottom) {
++                    if (wasAtBottom && !userHasScrolled) {
++                        // If we were at bottom and not manually scrolled, stay at bottom
++                        console.log('📜 Preserving bottom position after render');
++                        chatContainer.scrollTop = chatContainer.scrollHeight;
++                    } else if (!streamingConversations.has(currentConversationId)) {
++                        // If not streaming, preserve exact position to prevent jumps
++                        console.log('📜 Preserving scroll position after render:', position);
++                        chatContainer.scrollTop = position;
++                    }
++                } else {
++                    // In bottom-up mode, preserve position
++                    chatContainer.scrollTop = position;
++                }
++                
++                isRenderingRef.current = false;
++            });
++        };
++    }, [currentMessages, streamedContentMap, isTopToBottom, userHasScrolled, currentConversationId, streamingConversations]);
++
+     // Auto-scroll to bottom when new messages arrive or streaming updates occur
+     useEffect(() => {
+-        // Only auto-scroll in top-down mode when user hasn't manually scrolled away and not currently streaming
+-        if (!isTopToBottom || userHasScrolled) return;
+-
++        // Only auto-scroll in specific circumstances to prevent jumping
++        if (!isTopToBottom || userHasScrolled || isRenderingRef.current) return;
++        
++        // Only auto-scroll if we're not currently streaming (StreamedContent handles that)
++        if (streamingConversations.has(currentConversationId)) return;
++        
+         const chatContainer = chatContainerRef.current || document.querySelector('.chat-container') as HTMLElement;
+         if (!chatContainer) return;
+ 
+@@ -220,32 +268,26 @@ export const App: React.FC = () => {
+         const scrollToBottom = () => {
+             const { scrollTop, scrollHeight, clientHeight } = chatContainer as HTMLElement;
+             const isAtBottom = Math.abs(scrollHeight - scrollTop - clientHeight) < 20;
+-
++            
+             if (!isAtBottom) {
+-                // Only auto-scroll for new messages when not actively streaming
+-                // StreamedContent handles scrolling during streaming
+-                if (!streamingConversations.has(currentConversationId)) {
+-                    console.log('📜 App: Auto-scrolling to bottom for new messages');
+-                    chatContainer.scrollTo({
+-                        top: chatContainer.scrollHeight,
+-                        behavior: 'smooth'
+-                    });
+-                } else {
+-                    console.log('📜 App: Skipping auto-scroll - streaming active, StreamedContent will handle');
+-                }
++                console.log('📜 App: Auto-scrolling to bottom for new messages (non-streaming)');
++                chatContainer.scrollTo({
++                    top: chatContainer.scrollHeight,
++                    behavior: 'auto' // Use auto to prevent conflicts with other scroll logic
++                });
+             }
+         };
+-
++        
+         // Use requestAnimationFrame to ensure DOM has updated
+         requestAnimationFrame(scrollToBottom);
+-    }, [isTopToBottom, currentMessages, streamedContentMap, userHasScrolled, streamingConversations, currentConversationId]);
++    }, [isTopToBottom, currentMessages.length, userHasScrolled, streamingConversations, currentConversationId]);
+ 
+     // Reset userHasScrolled when switching conversations
+     useEffect(() => {
+         // Reset scroll state when switching to a new conversation
+         // This ensures auto-scroll works immediately in new conversations
+         setUserHasScrolled(false);
+-
++        
+         // Also scroll to bottom when switching conversations in top-down mode
+         if (isTopToBottom) {
+             setTimeout(() => {
+@@ -257,16 +299,6 @@ export const App: React.FC = () => {
+         }
+     }, [currentConversationId, isTopToBottom, setUserHasScrolled]);
+ 
+-    const handleNewChat = async () => {
+-        try {
+-            await startNewChat();
+-            setStreamedContentMap(new Map());
+-        } catch (error) {
+-            message.error('Failed to create new chat');
+-            console.error('Error creating new chat:', error);
+-        }
+-    };
+-
+     const handlePanelResize = (newWidth: number) => {
+         const minWidth = 200;
+         const maxWidth = Math.min(800, window.innerWidth - 350); // Leave at least 350px for chat
+@@ -497,7 +529,7 @@ export const App: React.FC = () => {
+                                     </>
+                                 )}
+                                 <Tooltip title="New Chat">
+-                                    <Button icon={<PlusOutlined />} onClick={handleNewChat} />
++                                    <Button icon={<PlusOutlined />} onClick={() => startNewChat()} />
+                                 </Tooltip>
+                             </div>
+                         </div>
+diff --git a/frontend/src/components/ShellConfigModal.tsx b/frontend/src/components/ShellConfigModal.tsx
+index dd5ba72..1fa18c1 100644
+--- a/frontend/src/components/ShellConfigModal.tsx
++++ b/frontend/src/components/ShellConfigModal.tsx
+@@ -1,5 +1,5 @@
+ import React, { useState, useEffect } from 'react';
+-import { Modal, Switch, Input, Button, List, Tag, Space, message, Divider, Checkbox, Collapse, Alert } from 'antd';
++import { Modal, Switch, Input, Button, List, Tag, Space, message, Divider, Checkbox, Collapse, Alert, Slider } from 'antd';
+ import { PlusOutlined, DeleteOutlined, WarningOutlined } from '@ant-design/icons';
+ 
+ interface ShellConfigModalProps {
+@@ -42,7 +42,7 @@ const ShellConfigModal: React.FC<ShellConfigModalProps> = ({ visible, onClose })
+                 allowedCommands: [],
+                 gitOperationsEnabled: true,
+                 safeGitOperations: [],
+-                timeout: 10
++                timeout: 30
+             });
+         }
+     };
+@@ -241,13 +241,20 @@ const ShellConfigModal: React.FC<ShellConfigModalProps> = ({ visible, onClose })
+                         <Divider />
+ 
+                         <div>
+-                            <h4>Command Timeout</h4>
+-                            <Input
+-                                type="number"
++                            <h4>Command Timeout: {config.timeout}s</h4>
++                            <Slider
++                                min={10}
++                                max={600}
+                                 value={config.timeout}
+-                                onChange={(e) => setConfig(prev => ({ ...prev!, timeout: parseInt(e.target.value) || 10 }))}
+-                                suffix="seconds"
+-                                style={{ width: 150 }}
++                                onChange={(value) => setConfig(prev => ({ ...prev!, timeout: value }))}
++                                marks={{
++                                    10: '10s',
++                                    60: '1m',
++                                    120: '2m',
++                                    300: '5m',
++                                    600: '10m'
++                                }}
++                                style={{ width: '100%', marginBottom: 20 }}
+                             />
+                         </div>
+ 
+diff --git a/frontend/src/plugins/d3/vegaLitePlugin.ts b/frontend/src/plugins/d3/vegaLitePlugin.ts
+index cd57a99..dd42a1b 100644
+--- a/frontend/src/plugins/d3/vegaLitePlugin.ts
++++ b/frontend/src/plugins/d3/vegaLitePlugin.ts
+@@ -616,8 +616,14 @@ export const vegaLitePlugin: D3RenderPlugin = {
+     // Fix invalid color names like "#green" 
+     try {
+       let specStringForColorFix = JSON.stringify(vegaSpec);
++      // Fix colors with # prefix that should be plain color names
+       specStringForColorFix = specStringForColorFix.replace(/"#(green|red|orange|blue|yellow|purple|black|white|gray|grey|cyan|magenta|pink|brown|violet|indigo|gold|silver)"/gi, '"$1"');
++      // Fix invalid color names that aren't real CSS colors
++      specStringForColorFix = specStringForColorFix.replace(/"rainbow"/gi, '"#ff6b6b"');
++      specStringForColorFix = specStringForColorFix.replace(/"gradient"/gi, '"#4ecdc4"');
++      specStringForColorFix = specStringForColorFix.replace(/"multicolor"/gi, '"#45b7d1"');
+       vegaSpec = JSON.parse(specStringForColorFix);
++      console.log('🔧 VEGA-POST-PROCESS: Applied color fixes to spec');
+     } catch (e) {
+       console.warn("Could not apply color fix to Vega-Lite spec", e);
+     }
+@@ -1247,10 +1253,55 @@ export const vegaLitePlugin: D3RenderPlugin = {
+         field: 'week',
+         type: 'ordinal',
+         title: 'Week'
++      }
++    }
++
++    // Fix line charts with y encoding missing field property
++    if (vegaSpec.mark && (vegaSpec.mark.type === 'line' || vegaSpec.mark === 'line') &&
++        vegaSpec.encoding && vegaSpec.encoding.y && !vegaSpec.encoding.y.field) {
++      console.log('Fixing line chart with y encoding missing field property');
++      
++      // If there's a fold transform, use the value field from it
++      if (vegaSpec.transform && vegaSpec.transform.some(t => t.fold)) {
++        const foldTransform = vegaSpec.transform.find(t => t.fold);
++        const valueField = foldTransform?.as?.[1] || 'value';
++        vegaSpec.encoding.y.field = valueField;
++        console.log(`Added y field from fold transform: "${valueField}"`);
++      } else if (vegaSpec.transform && vegaSpec.transform.some(t => t.calculate && t.as === 'y')) {
++        // If there's a calculated field 'y', use that
++        vegaSpec.encoding.y.field = 'y';
++        console.log('Added y field from calculated field: "y"');
++      }
++    }
++
++    // Fix regular line charts with fold transforms missing y-axis encoding
++    if (vegaSpec.mark && (vegaSpec.mark.type === 'line' || vegaSpec.mark === 'line') &&
++        vegaSpec.transform && vegaSpec.transform.some(t => t.fold) &&
++        vegaSpec.encoding && vegaSpec.encoding.x && !vegaSpec.encoding.y) {
++      console.log('Fixing line chart with fold transform missing y-axis encoding');
++      
++      // Find the fold transform to get the correct field name for the y-axis
++      const foldTransform = vegaSpec.transform.find(t => t.fold);
++      const yFieldName = foldTransform?.as?.[1] || 'value'; // Default to 'value' if not specified
++      
++      vegaSpec.encoding.y = {
++        field: yFieldName,
++        type: 'quantitative',
++        title: yFieldName.charAt(0).toUpperCase() + yFieldName.slice(1)
+       };
++      
++      // Also add color encoding to distinguish the different lines
++      if (!vegaSpec.encoding.color) {
++        const colorFieldName = foldTransform?.as?.[0] || 'key'; // Default to 'key' if not specified
++        vegaSpec.encoding.color = {
++          field: colorFieldName,
++          type: 'nominal',
++          title: colorFieldName.charAt(0).toUpperCase() + colorFieldName.slice(1)
++        };
++      }
+     }
+ 
+-    // Fix parallel coordinates charts missing x,y encodings
++    // Fix line charts with fold transforms missing y-axis encoding for the folded value field
+     if (vegaSpec.mark && (vegaSpec.mark.type === 'line' || vegaSpec.mark === 'line') &&
+         vegaSpec.transform && vegaSpec.transform.some(t => t.fold) &&
+         vegaSpec.encoding && vegaSpec.encoding.detail && !vegaSpec.encoding.x && !vegaSpec.encoding.y) {

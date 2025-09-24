@@ -1,0 +1,54 @@
+diff --git a/frontend/package.json b/frontend/package.json
+index 17e3ed3..c5d48f6 100644
+--- a/frontend/package.json
++++ b/frontend/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "frontend",
+-  "version": "0.1.0",
++  "version": "0.3.1",
+   "private": true,
+   "dependencies": {
+     "@ant-design/icons": "^5.0.0",
+diff --git a/pyproject.toml b/pyproject.toml
+index 839ea5d..f5bf683 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,6 @@
+ [tool.poetry]
+ name = "ziya"
+-version = "0.3.0"
++version = "0.3.1"
+ description = ""
+ authors = ["Vishnu Krishnaprasad <vishnukool@gmail.com>",
+            "Dan Cohn <chroma@gmail.com>"]
+@@ -25,7 +25,7 @@ cryptography = ">=3.4.8,<43.0.0"
+ pyOpenSSL = ">=20.0.0,<25.0.0"
+ # NumPy version constraint to support older GCC versions
+ numpy = ">=1.21.0,<2.0.0"
+-langchain-google-genai = "^2.1.0"
++langchain-google-genai = "2.0.4"
+ langchain = ">=0.3,<0.4"
+ langgraph = ">=0.2,<0.3"
+ langchainhub = ">=0.1.15"
+@@ -37,6 +37,7 @@ transformers = "^4.36.2"
+ setuptools = ">=68.0.0"
+ # AST parsing dependencies
+ cssutils = ">=2.6.0"
++google-generativeai = ">=0.8.5"
+ html5lib = ">=1.1"
+ tqdm = "^4.66.1"
+ # Document extraction dependencies
+diff --git a/setup.py b/setup.py
+index 41d68a1..fd0c3f9 100644
+--- a/setup.py
++++ b/setup.py
+@@ -39,7 +39,7 @@ def run_post_build():
+ # We're just adding our custom command class
+ setup(
+     name="ziya",
+-    version="0.2.3",
++    version="0.3.1",
+     packages=find_packages(include=["app", "app.*", "mcp_servers", "app.mcp_servers.*"]),
+     include_package_data=True,
+     zip_safe=False,

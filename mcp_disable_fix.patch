@@ -1,0 +1,286 @@
+diff --git a/app/agents/agent.py b/app/agents/agent.py
+index 1006fd6..5526df7 100644
+--- a/app/agents/agent.py
++++ b/app/agents/agent.py
+@@ -1808,31 +1808,34 @@ def create_agent_chain(chat_model: BaseChatModel):
+     # Create cache key based on model configuration
+     model_id = ModelManager.get_model_id() or getattr(chat_model, 'model_id', 'unknown')
+     ast_enabled = os.environ.get("ZIYA_ENABLE_AST") == "true"
+-    mcp_enabled = os.environ.get("ZIYA_ENABLE_MCP") != "false"
++    mcp_enabled = os.environ.get("ZIYA_ENABLE_MCP", "true").lower() in ("true", "1", "yes")
+     
+     # Get MCP tools first to include in cache key
+     mcp_tools = []
+-    try:
+-        from app.mcp.manager import get_mcp_manager
+-        from app.mcp.enhanced_tools import create_secure_mcp_tools
+-        mcp_manager = get_mcp_manager()
+-        # Ensure MCP is initialized before creating tools
+-        if not mcp_manager.is_initialized:
+-            # Don't initialize during startup - let server startup handle it
+-            logger.info("MCP manager not yet initialized, will use available tools when ready")
+-            mcp_tools = []
+-        else:
+-            mcp_tools = create_secure_mcp_tools()
+-            logger.info(f"Created {len(mcp_tools)} MCP tools for agent chain: {[tool.name for tool in mcp_tools]}")
++    if mcp_enabled:
++        try:
++            from app.mcp.manager import get_mcp_manager
++            from app.mcp.enhanced_tools import create_secure_mcp_tools
++            mcp_manager = get_mcp_manager()
++            # Ensure MCP is initialized before creating tools
++            if not mcp_manager.is_initialized:
++                # Don't initialize during startup - let server startup handle it
++                logger.info("MCP manager not yet initialized, will use available tools when ready")
++                mcp_tools = []
++            else:
++                mcp_tools = create_secure_mcp_tools()
++                logger.info(f"Created {len(mcp_tools)} MCP tools for agent chain: {[tool.name for tool in mcp_tools]}")
++            
++            if mcp_manager.is_initialized:
++                mcp_tools = create_secure_mcp_tools()
++                logger.info(f"Created {len(mcp_tools)} MCP tools for agent chain: {[tool.name for tool in mcp_tools]}")
++            else:
++                logger.warning("MCP manager not initialized, no MCP tools available")
+         
+-        if mcp_manager.is_initialized:
+-            mcp_tools = create_secure_mcp_tools()
+-            logger.info(f"Created {len(mcp_tools)} MCP tools for agent chain: {[tool.name for tool in mcp_tools]}")
+-        else:
+-            logger.warning("MCP manager not initialized, no MCP tools available")
+-    
+-    except Exception as e:
+-        logger.warning(f"Failed to get MCP tools for agent: {str(e)}")
++        except Exception as e:
++            logger.warning(f"Failed to get MCP tools for agent: {str(e)}")
++    else:
++        logger.debug("MCP is disabled, no tools will be created for agent chain")
+     
+     # Include MCP tool count in cache key to ensure different chains for different tool availability
+     cache_key = f"{model_id}_{ast_enabled}_{mcp_enabled}_{len(mcp_tools)}"
+@@ -2099,22 +2102,26 @@ def create_agent_executor(agent_chain: Runnable):
+ 
+     # Get MCP tools for the executor
+     mcp_tools = []
+-    try:
+-        logger.info("Attempting to get MCP tools for agent executor...")
+-        
+-        from app.mcp.manager import get_mcp_manager
+-        mcp_manager = get_mcp_manager()
+-        
+-        if mcp_manager.is_initialized:
+-            mcp_tools = create_mcp_tools()
+-            logger.info(f"Created agent executor with {len(mcp_tools)} MCP tools")
+-            for tool in mcp_tools:
+-                logger.info(f"  - {tool.name}: {tool.description}")
+-        else:
+-            logger.info("MCP not initialized, no MCP tools available")
+-    except Exception as e:
+-        logger.warning(f"Failed to initialize MCP tools: {str(e)}", exc_info=True)
+-        from app.mcp.manager import get_mcp_manager
++    # Check if MCP is enabled before creating tools
++    if os.environ.get("ZIYA_ENABLE_MCP", "true").lower() in ("true", "1", "yes"):
++        try:
++            logger.info("Attempting to get MCP tools for agent executor...")
++            
++            from app.mcp.manager import get_mcp_manager
++            mcp_manager = get_mcp_manager()
++            
++            if mcp_manager.is_initialized:
++                mcp_tools = create_mcp_tools()
++                logger.info(f"Created agent executor with {len(mcp_tools)} MCP tools")
++                for tool in mcp_tools:
++                    logger.info(f"  - {tool.name}: {tool.description}")
++            else:
++                logger.info("MCP not initialized, no MCP tools available")
++        except Exception as e:
++            logger.warning(f"Failed to initialize MCP tools: {str(e)}", exc_info=True)
++            from app.mcp.manager import get_mcp_manager
++    else:
++        logger.debug("MCP is disabled, no tools will be created for agent executor")
+         mcp_manager = get_mcp_manager()
+ 
+     logger.info(f"AGENT_EXECUTOR: Tools being passed to AgentExecutor: {[tool.name for tool in mcp_tools] if mcp_tools else 'No tools'}")
+diff --git a/app/extensions/prompt_extensions/mcp_prompt_extensions.py b/app/extensions/prompt_extensions/mcp_prompt_extensions.py
+index 70d2b9b..7ed0532 100644
+--- a/app/extensions/prompt_extensions/mcp_prompt_extensions.py
++++ b/app/extensions/prompt_extensions/mcp_prompt_extensions.py
+@@ -61,6 +61,12 @@ def mcp_usage_guidelines(prompt: str, context: dict) -> str:
+         logger.info("MCP_GUIDELINES: Skipping for gemini-2.5-pro due to prompt size limits")
+         return prompt
+     
++    # Check if MCP is enabled
++    import os
++    if not os.environ.get("ZIYA_ENABLE_MCP", "true").lower() in ("true", "1", "yes"):
++        logger.info("MCP_GUIDELINES: MCP is disabled, returning original prompt")
++        return prompt
++    
+     # Check if MCP tools are available in the context
+     # This would be passed from the agent system when MCP is initialized
+     mcp_tools_available = context.get("mcp_tools_available", False)
+diff --git a/app/mcp/manager.py b/app/mcp/manager.py
+index 2f32730..5edbcee 100644
+--- a/app/mcp/manager.py
++++ b/app/mcp/manager.py
+@@ -334,16 +334,16 @@ class MCPManager:
+                     logger.error(f"No configuration found for server '{server_name}' during restart.")
+                     return False
+             
+-                # Create and connect new client
+-                client = MCPClient(server_config)
+-                self.clients[server_name] = client
+-                success = await self._connect_server(server_name, client)
+-                
+-                # Invalidate cache when client configuration changes
+-                self.invalidate_tools_cache()
+-                
+-                logger.info(f"Server {server_name} restart {'successful' if success else 'failed'}")
+-                return success
++            # Create and connect new client
++            client = MCPClient(server_config)
++            self.clients[server_name] = client
++            success = await self._connect_server(server_name, client)
++            
++            # Invalidate cache when client configuration changes
++            self.invalidate_tools_cache()
++            
++            logger.info(f"Server {server_name} restart {'successful' if success else 'failed'}")
++            return success
+             
+         except Exception as e:
+             logger.error(f"Error restarting server {server_name}: {str(e)}")
+@@ -559,6 +559,28 @@ class MCPManager:
+ _mcp_manager: Optional[MCPManager] = None
+ def get_mcp_manager() -> MCPManager:
+     """Get the global MCP manager instance."""
++    import os
++    
++    # Check if MCP is enabled before creating manager
++    if not os.environ.get("ZIYA_ENABLE_MCP", "true").lower() in ("true", "1", "yes"):
++        # Return a dummy manager that's never initialized when MCP is disabled
++        class DisabledMCPManager:
++            def __init__(self):
++                self.is_initialized = False
++                self.clients = {}
++                self.server_configs = {}
++            
++            async def initialize(self):
++                pass
++            
++            def get_all_tools(self):
++                return []
++            
++            def get_server_status(self):
++                return {}
++                
++        return DisabledMCPManager()
++    
+     global _mcp_manager
+     if _mcp_manager is None:
+         _mcp_manager = MCPManager()
+diff --git a/app/server.py b/app/server.py
+index 093b317..3e1be55 100644
+--- a/app/server.py
++++ b/app/server.py
+@@ -140,13 +140,17 @@ def build_messages_for_streaming(question: str, chat_history: List, files: List,
+     
+     # Get available tools for the template
+     tools_list = []
+-    try:
+-        from app.mcp.manager import get_mcp_manager
+-        mcp_manager = get_mcp_manager()
+-        if mcp_manager.is_initialized:
+-            tools_list = [f"- {tool.name}: {tool.description}" for tool in mcp_manager.get_all_tools()]
+-    except Exception as e:
+-        logger.warning(f"Could not get tools for template: {e}")
++    # Check if MCP is enabled before loading tools
++    if os.environ.get("ZIYA_ENABLE_MCP", "true").lower() in ("true", "1", "yes"):
++        try:
++            from app.mcp.manager import get_mcp_manager
++            mcp_manager = get_mcp_manager()
++            if mcp_manager.is_initialized:
++                tools_list = [f"- {tool.name}: {tool.description}" for tool in mcp_manager.get_all_tools()]
++        except Exception as e:
++            logger.warning(f"Could not get tools for template: {e}")
++    else:
++        logger.debug("MCP is disabled, no tools will be loaded for template")
+     
+     # Build messages manually to ensure proper conversation history
+     messages = []
+@@ -1134,7 +1138,27 @@ async def stream_chunks(body):
+             
+             # Format the system message
+             formatted_system_content = system_content.replace('{codebase}', codebase_content)
+-            formatted_system_content = formatted_system_content.replace('{tools}', 'MCP tools available')
++            
++            # Check if MCP is actually enabled and has tools
++            mcp_tools_text = "No tools available"
++            # Check if MCP is enabled before loading tools
++            if os.environ.get("ZIYA_ENABLE_MCP", "true").lower() in ("true", "1", "yes"):
++                try:
++                    mcp_manager = get_mcp_manager()
++                    if mcp_manager.is_initialized:
++                        available_tools = mcp_manager.get_all_tools()
++                        if available_tools:
++                            mcp_tools_text = f"MCP tools available: {', '.join([tool.name for tool in available_tools])}"
++                        else:
++                            mcp_tools_text = "MCP initialized but no tools available"
++                    else:
++                        mcp_tools_text = "MCP tools disabled"
++                except Exception as e:
++                    mcp_tools_text = "MCP tools unavailable"
++            else:
++                mcp_tools_text = "MCP tools disabled"
++                
++            formatted_system_content = formatted_system_content.replace('{tools}', mcp_tools_text)
+             
+             messages.append({'type': 'system', 'content': formatted_system_content})
+         
+@@ -1344,24 +1368,29 @@ async def stream_chunks(body):
+                         
+                         # Get available tools including MCP tools
+                         tools = []
+-                        try:
+-                            from app.mcp.manager import get_mcp_manager
+-                            mcp_manager = get_mcp_manager()
+-                            logger.debug(f"MCP manager initialized: {mcp_manager.is_initialized}")
+-                            if mcp_manager.is_initialized:
+-                                # Convert MCP tools to Bedrock format
+-                                mcp_tools = mcp_manager.get_all_tools()
+-                                logger.debug(f"Found {len(mcp_tools)} MCP tools")
+-                                for tool in mcp_tools:
+-                                    logger.debug(f"MCP tool: {tool.name}")
+-                                    tools.append({
+-                                        'name': tool.name,
+-                                    'description': tool.description,
+-                                    'input_schema': getattr(tool, 'inputSchema', getattr(tool, 'input_schema', {}))
+-                                })
+-                        except Exception as e:
+-                            logger.debug(f"MCP tool loading error: {e}")
+-                            logger.warning(f"Could not get MCP tools: {e}")
++                        
++                        # Check if MCP is enabled before loading tools
++                        if not os.environ.get("ZIYA_ENABLE_MCP", "true").lower() in ("true", "1", "yes"):
++                            logger.debug("MCP is disabled, no tools will be loaded")
++                        else:
++                            try:
++                                from app.mcp.manager import get_mcp_manager
++                                mcp_manager = get_mcp_manager()
++                                logger.debug(f"MCP manager initialized: {mcp_manager.is_initialized}")
++                                if mcp_manager.is_initialized:
++                                    # Convert MCP tools to Bedrock format
++                                    mcp_tools = mcp_manager.get_all_tools()
++                                    logger.debug(f"Found {len(mcp_tools)} MCP tools")
++                                    for tool in mcp_tools:
++                                        logger.debug(f"MCP tool: {tool.name}")
++                                        tools.append({
++                                            'name': tool.name,
++                                        'description': tool.description,
++                                        'input_schema': getattr(tool, 'inputSchema', getattr(tool, 'input_schema', {}))
++                                    })
++                            except Exception as e:
++                                logger.debug(f"MCP tool loading error: {e}")
++                                logger.warning(f"Could not get MCP tools: {e}")
+                         
+                         # Add shell tool if no MCP tools available
+                         if not tools:
