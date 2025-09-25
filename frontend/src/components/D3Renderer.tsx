@@ -6,6 +6,7 @@ import * as d3 from 'd3';
 import { D3RenderPlugin } from '../types/d3';
 import { d3RenderPlugins } from '../plugins/d3/registry';
 import { isDiagramDefinitionComplete } from '../utils/diagramUtils';
+import { ContainerSizingManager } from '../utils/containerSizing';
 
 type RenderType = 'auto' | 'vega-lite' | 'd3';
 
@@ -40,6 +41,31 @@ function findPlugin(spec: any): D3RenderPlugin | undefined {
     }
 }
 
+// Helper function to sanitize specs by removing null/undefined values
+function sanitizeSpec(obj: any): any {
+    if (obj === undefined) {
+        return undefined;
+    }
+    if (obj === null) {
+        return null;
+    }
+    if (Array.isArray(obj)) {
+        return obj.map(sanitizeSpec).filter(v => v !== undefined);
+    }
+    if (typeof obj === 'object') {
+        const newObj: any = {};
+        for (const key in obj) {
+            if (Object.prototype.hasOwnProperty.call(obj, key)) {
+                const value = sanitizeSpec(obj[key]);
+                if (value !== undefined) {
+                    newObj[key] = value;
+                }
+            }
+        }
+        return newObj;
+    }
+    return obj;
+}
 // Helper function to estimate diagram size based on content
 function estimateDiagramSize(spec: any, plugin?: D3RenderPlugin): { width: number; height: number } {
     // Default fallback sizes
@@ -87,6 +113,7 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
     const [isLoading, setIsLoading] = useState(true);
     const [renderError, setRenderError] = useState<string | null>(null);
     const [displayWaitingMessage, setDisplayWaitingMessage] = useState<boolean>(false);
+    const [showRawContent, setShowRawContent] = useState(true); // Start with raw content visible
     const [hasAttemptedRender, setHasAttemptedRender] = useState<boolean>(false);
     const [errorDetails, setErrorDetails] = useState<string[]>([]);
     const cleanupRef = useRef<(() => void) | null>(null);
@@ -99,14 +126,30 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
     const lastUsedPluginRef = useRef<D3RenderPlugin | null>(null);
     const lastValidSpecRef = useRef<any>(null);
     const [renderingStarted, setRenderingStarted] = useState<boolean>(false);
+    const initialThemeRef = useRef<boolean>(isDarkMode);
     const hasSuccessfulRenderRef = useRef<boolean>(false);
 
     // New state for size reservation and rendering control
     const cleanupFunctionsRef = useRef<(() => void)[]>([]);
     const [reservedSize, setReservedSize] = useState<{ width: number; height: number } | null>(null);
+    const sizingManagerRef = useRef<ContainerSizingManager | null>(null);
 
     // Store the spec in a ref to avoid unnecessary re-renders
     useEffect(() => { lastSpecRef.current = spec; }, [spec]);
+
+    // Get raw content for display during streaming
+    const getRawContent = useCallback(() => {
+        if (typeof spec === 'string') {
+            return spec;
+        } else if (spec?.definition) {
+            return spec.definition;
+        } else if (typeof spec === 'object') {
+            return JSON.stringify(spec, null, 2);
+        }
+        return '';
+    }, [spec]);
+
+    const rawContent = getRawContent();
 
     // Estimate and reserve size early
     useEffect(() => {
@@ -118,9 +161,32 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
         }
     }, [spec, reservedSize]);
 
+    // Control when to show raw content vs rendered visualization
+    useEffect(() => {
+        if (isStreaming || !isMarkdownBlockClosed) {
+            setShowRawContent(true);
+        } else if (!isStreaming && isMarkdownBlockClosed) {
+            setShowRawContent(false);
+        }
+    }, [spec, reservedSize]);
+
+    // Control when to show raw content vs rendered visualization
+    useEffect(() => {
+        if (isStreaming || !isMarkdownBlockClosed) {
+            setShowRawContent(true);
+        } else if (!isStreaming && isMarkdownBlockClosed) {
+            setShowRawContent(false);
+        }
+    }, [isStreaming, isMarkdownBlockClosed, hasSuccessfulRenderRef.current]);
+
     // Comprehensive cleanup on unmount
     useEffect(() => {
         return () => {
+            // Clean up sizing manager
+            if (sizingManagerRef.current) {
+                sizingManagerRef.current.cleanup();
+                sizingManagerRef.current = null;
+            }
             mounted.current = false;
             console.debug('D3Renderer cleanup triggered');
 
@@ -168,7 +234,8 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
             setRenderingStarted(true);
         }
 
-        if ((!hasAttemptedRender || !isStreaming) && !hasSuccessfulRenderRef.current) {
+        // Don't show loading state if we're showing raw content
+        if ((!hasAttemptedRender || !isStreaming) && !hasSuccessfulRenderRef.current && !showRawContent) {
             setIsLoading(true);
         }
         try {
@@ -184,8 +251,8 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
             let specLines: string[];
 
             // Determine if we should attempt to render or show waiting message
-            let attemptRender = true;
-            let localShouldShowWaitingPlaceholder = false;
+            let attemptRender = !isStreaming || isMarkdownBlockClosed || forceRender;
+            let localShouldShowWaitingPlaceholder = isStreaming && !isMarkdownBlockClosed && !forceRender;
 
             try {
                 if (typeof spec === 'string') {
@@ -213,8 +280,6 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
                 // During streaming, this could be an incomplete JSON
                 if (isStreaming && !isMarkdownBlockClosed) {
                     streamingContentRef.current = typeof spec === 'string' ? spec : null;
-                    localShouldShowWaitingPlaceholder = true;
-                    attemptRender = false;
                     if (isLoading && !hasSuccessfulRenderRef.current) setIsLoading(false);
                     setDisplayWaitingMessage(true);
                     return;
@@ -233,13 +298,12 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
                 if (isStreaming && !isMarkdownBlockClosed) {
                     const plugin = findPlugin(parsed);
 
-                    // If we have a plugin with isDefinitionComplete method, use it
-                    if (plugin?.isDefinitionComplete && typeof parsed.definition === 'string') {
-                        const isComplete = plugin.isDefinitionComplete(parsed.definition);
+                    // If we have a plugin with isDefinitionComplete method, use it on the original spec string
+                    if (plugin?.isDefinitionComplete && typeof spec === 'string') {
+                        const isComplete = plugin.isDefinitionComplete(spec);
                         console.debug(`Checking if ${plugin.name} definition is complete:`, isComplete);
 
                         if (!isComplete) {
-                            localShouldShowWaitingPlaceholder = true;
                             attemptRender = false;
                         }
                     } else if (specType === 'mermaid' || specType === 'graphviz') {
@@ -250,7 +314,6 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
                         );
 
                         if (!isComplete) {
-                            localShouldShowWaitingPlaceholder = true;
                             attemptRender = false;
                         }
                     }
@@ -262,7 +325,7 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
                 }
             }
 
-            // Update the waiting message state
+            // Update the waiting message state based on streaming and render attempt
             setDisplayWaitingMessage(localShouldShowWaitingPlaceholder);
 
             // If we're not attempting to render, exit early
@@ -271,108 +334,6 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
             } else {
                 // Mark that we've attempted a render
                 setHasAttemptedRender(true);
-            }
-
-            // Special handling for Mermaid diagrams
-            if (parsed.type === 'mermaid') {
-                // Pre-process the definition to fix common syntax issues
-                if (typeof parsed.definition === 'string') {
-                    // FIRST: Remove HTML tags that cause parsing issues
-                    parsed.definition = parsed.definition.replace(/<br\s*\/?>/gi, '\n');
-                    parsed.definition = parsed.definition.replace(/<\/br>/gi, '');
-                    parsed.definition = parsed.definition.replace(/<[^>]+>/g, '');
-
-                    // Detect diagram type
-                    const firstLine = parsed.definition.trim().split('\n')[0].toLowerCase();
-                    const diagramType = firstLine.replace(/^(\w+).*$/, '$1').toLowerCase();
-
-                    // Apply diagram-specific fixes
-                    if (diagramType === 'flowchart' || diagramType === 'graph' || firstLine.startsWith('flowchart ') || firstLine.startsWith('graph ')) {
-                        // PRIORITY FIX: Handle parentheses and special characters in node labels
-                        parsed.definition = parsed.definition.replace(/(\w+)\[([^\]]*)\]/g, (match, nodeId, content) => {
-                            // Quote content that contains special characters
-                            if (/[()\/\n<>]/.test(content) && !content.match(/^".*"$/)) {
-                                // Don't double-escape already escaped quotes
-                                const escapedContent = content.replace(/\\"/g, '"').replace(/"/g, '\\"');
-                                return `${nodeId}["${escapedContent}"]`;
-                            }
-                            return match;
-                        });
-
-                        // Fix subgraph class syntax
-                        parsed.definition = parsed.definition.replace(/class\s+(\w+)\s+subgraph-(\w+)/g, 'class $1 style_$2');
-                        parsed.definition = parsed.definition.replace(/classDef\s+subgraph-(\w+)/g, 'classDef style_$1');
-
-                        // Fix "Send DONE Marker" nodes
-                        parsed.definition = parsed.definition.replace(/\[Send\s+"DONE"\s+Marker\]/g, '[Send DONE Marker]');
-                        parsed.definition = parsed.definition.replace(/\[Send\s+\[DONE\]\s+Marker\]/g, '[Send DONE Marker]');
-
-                        // Fix SendDone nodes
-                        parsed.definition = parsed.definition.replace(/SendDone\[([^\]]+)\]/g, 'sendDoneNode["$1"]');
-
-                        // Fix end nodes that cause parsing errors - replace all 'end' node references
-                        parsed.definition = parsed.definition.replace(/\bend\b\s*\[/g, 'endNode[');
-                        parsed.definition = parsed.definition.replace(/-->\s*\bend\b/g, '--> endNode');
-                        parsed.definition = parsed.definition.replace(/\bend\b\s*-->/g, 'endNode -->');
-
-                        // Convert flowchart to graph LR if needed for better compatibility
-                        if (parsed.definition.startsWith('flowchart ')) {
-                            parsed.definition = parsed.definition.replace(/^flowchart\s+/m, 'graph ');
-                        }
-                    }
-
-                    else if (diagramType === 'requirement') {
-                        // Fix requirement diagram syntax
-                        const lines = parsed.definition.split('\n');
-                        const result: string[] = [];
-
-                        for (let i = 0; i < lines.length; i++) {
-                            let line = lines[i].trim();
-
-                            // Fix ID format
-                            if (line.match(/^\s*id:/i)) {
-                                line = line.replace(/id:\s*([^,]+)/, 'id: "$1"');
-                            }
-
-                            // Fix text format
-                            if (line.match(/^\s*text:/i)) {
-                                line = line.replace(/text:\s*([^,]+)/, 'text: "$1"');
-                            }
-
-                            result.push(line);
-                        }
-
-                        parsed.definition = result.join('\n');
-                    }
-                    else if (diagramType === 'xychart') {
-                        // Fix xychart array syntax
-                        parsed.definition = parsed.definition.replace(/\[(.*?)\]/g, '"[$1]"');
-                    }
-
-                    // Fix quoted text in node labels
-                    parsed.definition = parsed.definition.replace(/\[([^"\]]*)"([^"\]]*)"([^"\]]*)\]/g, (match, before, quoted, after) => {
-                        // Replace with simple text without quotes to avoid parsing issues
-                        return `[${before}${quoted}${after}]`;
-                    });
-
-                    // Fix end nodes that cause parsing errors - replace all 'end' node references
-                    parsed.definition = parsed.definition.replace(/\bend\b\s*\[/g, 'endNode[');
-                    parsed.definition = parsed.definition.replace(/-->\s*\bend\b/g, '--> endNode');
-                    parsed.definition = parsed.definition.replace(/\bend\b\s*-->/g, 'endNode -->');
-
-                    // Fix nodes with square brackets in their text
-                    parsed.definition = parsed.definition.replace(/\[([^\]]*\[[^\]]*\][^\]]*)\]/g, (match, content) => {
-                        // Replace inner square brackets with parentheses
-                        return `["${content.replace(/\[/g, '(').replace(/\]/g, ')')}"]`;
-                    });
-
-                    // Convert flowchart to graph LR if needed for better compatibility
-                    if (parsed.definition.startsWith('flowchart ')) {
-                        parsed.definition = parsed.definition.replace(/^flowchart\s+/m, 'graph ');
-                    }
-
-                    console.debug('Pre-processed Mermaid definition for better compatibility');
-                }
             }
 
             // Log the parsed spec for debugging
@@ -384,9 +345,23 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
             // Only proceed with rendering if we have a valid parsed spec
             if (!parsed) return;
 
-            if (type === 'd3' || parsed.renderer === 'd3' || typeof parsed.render === 'function') {
+            const plugin = findPlugin(parsed);
+            if (type === 'd3' || parsed.renderer === 'd3' || typeof parsed.render === 'function' || plugin) {
                 const container = d3ContainerRef.current;
                 if (!container) return;
+
+                // Check if this is a Graphviz or Mermaid plugin
+                const plugin = findPlugin(parsed);
+                lastUsedPluginRef.current = plugin || null;
+
+                // Initialize sizing manager if we have a plugin with sizing config
+                if (plugin?.sizingConfig && !sizingManagerRef.current) {
+                    sizingManagerRef.current = new ContainerSizingManager();
+                    sizingManagerRef.current.applySizingConfig(container, plugin.sizingConfig, isDarkMode);
+                    cleanupFunctionsRef.current.push(() => {
+                        sizingManagerRef.current?.cleanup();
+                    });
+                }
 
                 // Cleanup existing simulation
                 if (simulationRef.current) {
@@ -404,9 +379,6 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
                 container.style.position = 'relative';
                 container.style.overflow = 'hidden';
 
-                // Check if this is a Graphviz or Mermaid plugin
-                const plugin = findPlugin(parsed);
-                lastUsedPluginRef.current = plugin || null;
                 const isGraphvizOrMermaid = plugin?.name === 'graphviz-renderer' || plugin?.name === 'mermaid-renderer';
 
                 // For Graphviz or Mermaid, override the container style to be more flexible
@@ -430,8 +402,9 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
                         container.removeChild(container.firstChild);
                     }
 
+                    const sanitizedParsed = sanitizeSpec(parsed);
                     if (typeof parsed.render === 'function') {
-                        const result = parsed.render.call(parsed, tempContainer, d3);
+                        const result = sanitizedParsed.render.call(sanitizedParsed, tempContainer, d3);
                         renderSuccessful = true;
 
                         // If result is a function, use it as cleanup
@@ -449,15 +422,16 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
                                 }
                             });
                         }
-                    } else if (parsed.type === 'network') {
-                        const plugin = findPlugin(parsed);
+                    } else if (sanitizedParsed.type === 'network') {
+                        const plugin = findPlugin(sanitizedParsed);
                         if (plugin) {
                             plugin.render(tempContainer, d3, {
-                                ...parsed,
+                                ...sanitizedParsed,
                                 width: width || 600,
                                 height: height || 400,
-                                isStreaming: isStreaming && !isMarkdownBlockClosed,
-                                forceRender: attemptRender
+                                isStreaming: isStreaming,
+                                isMarkdownBlockClosed: isMarkdownBlockClosed,
+                                forceRender: forceRender,
                             }, isDarkMode);
                             renderSuccessful = true;
                         }
@@ -470,26 +444,24 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
                         };
                         cleanupFunctionsRef.current.push(pluginCleanup);
 
-                        const plugin = findPlugin(parsed);
+                        const plugin = findPlugin(sanitizedParsed);
                         if (!plugin) {
                             throw new Error('No render function or compatible plugin found');
                         }
 
                         console.debug('Using plugin:', plugin.name);
                         plugin.render(tempContainer, d3, {
-                            ...parsed,
-                            isStreaming: isStreaming && !isMarkdownBlockClosed,
-                            forceRender: attemptRender
+                            ...sanitizedParsed,
+                            isStreaming: isStreaming,
+                            isMarkdownBlockClosed: isMarkdownBlockClosed,
+                            forceRender: forceRender,
                         }, isDarkMode);
                         renderSuccessful = true;
                         if (mounted.current) setRenderError(null);
                     }
 
-                    // Only replace main container content if render was successful
-                    if (renderSuccessful) {
-                        container.innerHTML = '';
-                        container.appendChild(tempContainer);
-                    }
+
+
                 } catch (renderError) {
                     console.error('D3 render error:', renderError);
                     if (mounted.current) {
@@ -497,6 +469,13 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
                         setErrorDetails([renderError instanceof Error ? renderError.message : 'Unknown error']);
                     }
                 }
+
+                // Only replace main container content if render was successful
+                if (renderSuccessful) {
+                    container.innerHTML = '';
+                    container.appendChild(tempContainer);
+                }
+
 
                 if (!renderSuccessful) {
                     throw new Error('Render did not complete successfully');
@@ -527,53 +506,6 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
                 hasSuccessfulRenderRef.current = true;
                 return;
             }
-
-            // Handle Vega-Lite rendering
-            const container = vegaContainerRef.current;
-            if (!container) return;
-
-            const vegaSpec = {
-                $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
-                width: width || 'container',
-                height: height || 300,
-                mark: parsed.type || 'point',
-                data: {
-                    values: Array.isArray(parsed.data) ? parsed.data : [parsed.data]
-                },
-                encoding: parsed.encoding || {
-                    x: { field: 'x', type: 'quantitative' },
-                    y: { field: 'y', type: 'quantitative' }
-                },
-                ...parsed
-            };
-
-            if (vegaViewRef.current) {
-                vegaViewRef.current.finalize();
-                vegaViewRef.current = null;
-            }
-
-            console.debug('Rendering Vega spec:', vegaSpec);
-            const result = await vegaEmbed(container, vegaSpec, {
-                actions: false,
-                theme: isDarkMode ? 'dark' : 'excel',
-                renderer: 'canvas'
-            });
-
-            if (!mounted.current) {
-                result.view.finalize();
-                return;
-            }
-
-            vegaViewRef.current = result.view;
-            cleanupFunctionsRef.current.push(() => {
-                if (result.view) {
-                    result.view.finalize();
-                }
-            });
-            setIsLoading(false);
-            hasSuccessfulRenderRef.current = true;
-            onLoad?.();
-
         } catch (error: any) {
             if (isStreaming && !isMarkdownBlockClosed) {
                 console.debug('Suppressing streaming error:', error.message);
@@ -596,23 +528,29 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
     useEffect(() => {
         if (!mounted.current) return;
 
-        // Only re-render if content has actually changed or we're forcing a render
-        const shouldRender = !hasSuccessfulRenderRef.current ||
-            !isMarkdownBlockClosed ||
-            forceRender;
+        // Trigger rendering immediately when markdown block closes, even during streaming
+        const shouldRender = (
+            !hasSuccessfulRenderRef.current ||
+            isMarkdownBlockClosed ||  // Render as soon as block closes, don't wait for streaming to end
+            forceRender
+        ) && spec && (typeof spec === 'string' ? spec.trim().length > 0 : true);
 
         if (shouldRender) {
             const currentRender = ++renderIdRef.current;
-            console.debug(`Starting render #${currentRender}`);
+            console.debug(`Starting render #${currentRender}, isStreaming: ${isStreaming}, blockClosed: ${isMarkdownBlockClosed}`);
             initializeVisualization(forceRender);
         }
-    }, [spec, isMarkdownBlockClosed, forceRender, initializeVisualization]);
-
+    }, [spec, isStreaming, isMarkdownBlockClosed, forceRender, initializeVisualization]);
     // Separate effect for theme changes to avoid circular dependencies
     useEffect(() => {
-        if (lastSpecRef.current && hasSuccessfulRenderRef.current) {
+        // Only re-render for theme changes if we've already had a successful render
+        // and this isn't the initial theme setting  
+        if (lastSpecRef.current && hasSuccessfulRenderRef.current && renderingStarted &&
+            isDarkMode !== initialThemeRef.current) {
             console.log('Theme changed, re-rendering visualization');
-            initializeVisualization();
+            setTimeout(() => {
+                initializeVisualization();
+            }, 100);
         }
     }, [isDarkMode, initializeVisualization]);
 
@@ -621,124 +559,46 @@ export const D3Renderer: React.FC<D3RendererProps> = ({
         return type === 'd3' || (typeof spec === 'object' && (spec?.renderer === 'd3' || !!plugin));
     }, [type, spec]);
 
-    // Determine if it's specifically a Mermaid render
-    const isMermaidRender = useMemo(() => {
-        const plugin = typeof spec === 'object' && spec !== null ? findPlugin(spec) : undefined;
-        return plugin?.name === 'mermaid-renderer';
+    // Get current plugin for styling decisions
+    const currentPlugin = useMemo(() => {
+        return typeof spec === 'object' && spec !== null ? findPlugin(spec) : undefined;
     }, [spec]);
 
-    // Determine if it's specifically a Graphviz render
-    const isGraphvizRender = useMemo(() => {
-        const plugin = typeof spec === 'object' && spec !== null ? findPlugin(spec) : undefined;
-        return plugin?.name === 'graphviz-renderer';
-    }, [spec]);
+    // Get container styles from plugin config or use defaults
+    const containerStyles = useMemo(() => {
+        const plugin = currentPlugin;
+        if (plugin?.sizingConfig?.containerStyles) {
+            const baseStyles = plugin.sizingConfig.containerStyles;
 
-    // Determine if it's specifically a Vega-Lite render
-    const isVegaLiteRender = useMemo(() => {
-        const plugin = typeof spec === 'object' && spec !== null ? findPlugin(spec) : undefined;
-        return plugin?.name === 'vega-lite-renderer';
-    }, [spec]);
-
-    // Determine if it's specifically a Joint.js render
-    const isJointRender = useMemo(() => {
-        const plugin = typeof spec === 'object' && spec !== null ? findPlugin(spec) : undefined;
-        return plugin?.name === 'joint-renderer';
-    }, [spec]);
-
-    // Add a specific effect for theme changes to force re-rendering of Mermaid and Graphviz diagrams
-    useEffect(() => {
-        // Only run this effect when theme changes and we have a Mermaid or Graphviz diagram
-        if ((isMermaidRender || isGraphvizRender) && d3ContainerRef.current) {
-            console.debug(`Theme changed for ${isMermaidRender ? 'Mermaid' : 'Graphviz'} diagram, re-rendering`);
-
-            // For Mermaid, apply post-render fixes
-            if (isMermaidRender) {
-                const svgElement = d3ContainerRef.current.querySelector('svg');
-                if (svgElement) {
-                    if (isDarkMode) {
-                        // Fix for arrow markers in dark mode
-                        svgElement.querySelectorAll('defs marker path').forEach(el => {
-                            el.setAttribute('stroke', '#88c0d0');
-                            el.setAttribute('fill', '#88c0d0');
-                        });
-
-                        // Fix for all SVG paths and lines
-                        svgElement.querySelectorAll('line, path:not([fill])').forEach(el => {
-                            el.setAttribute('stroke', '#88c0d0');
-                            el.setAttribute('stroke-width', '1.5');
-                        });
-
-                        // Text on darker backgrounds should be black for contrast
-                        svgElement.querySelectorAll('.node .label text, .cluster .label text').forEach(el => {
-                            el.setAttribute('fill', '#000000');
-                        });
-
-                        // Node and cluster styling
-                        svgElement.querySelectorAll('.node rect, .node circle, .node polygon, .node path').forEach(el => {
-                            el.setAttribute('stroke', '#81a1c1');
-                            el.setAttribute('fill', '#5e81ac');
-                        });
-
-                        svgElement.querySelectorAll('.cluster rect').forEach(el => {
-                            el.setAttribute('stroke', '#81a1c1');
-                            el.setAttribute('fill', '#4c566a');
-                        });
-                    }
-                }
+            // Apply sizing strategy overrides
+            if (plugin.sizingConfig.sizingStrategy === 'auto-expand') {
+                return {
+                    ...baseStyles,
+                    height: 'auto',
+                    minHeight: 'auto',
+                    overflow: plugin.sizingConfig.needsOverflowVisible ? 'visible' : (baseStyles.overflow || 'auto')
+                };
             }
 
-            // For Graphviz, trigger a complete re-render
-            if (isGraphvizRender && typeof spec === 'object') {
-                // Find the theme button and click it to trigger a re-render
-                const themeButton = d3ContainerRef.current.querySelector('.graphviz-theme-button');
-                if (themeButton) {
-                    (themeButton as HTMLButtonElement).click();
-                } else {
-                    // If no theme button, force a re-render by triggering a new render cycle
-                    // This is a simpler approach that avoids referencing initializeVisualization
-                    renderIdRef.current++; // Increment render ID to force a new render
-
-                    // Force re-render by updating a state
-                    setIsLoading(true);
-                    setTimeout(() => {
-                        if (mounted.current) {
-                            setIsLoading(false);
-                        }
-                    }, 10);
-                }
-            }
+            return baseStyles;
         }
-    }, [isDarkMode, isMermaidRender, isGraphvizRender, spec]);
-
-    const containerStyles = useMemo(() =>
-        isMermaidRender ? {
-            height: 'auto !important',
-            minHeight: 'unset',
-            overflow: 'visible'
-        } : {
+        return {
             height: height || '400px',
             overflow: 'auto'
-        }, [isMermaidRender, height]);
+        };
+    }, [currentPlugin, height]);
 
     const outerContainerStyle: CSSProperties = {
         position: 'relative',
         width: '100%',
         maxWidth: '100%',
-        height: isJointRender ? '600px' : 'auto',
+        height: 'auto',
         display: 'block',
         margin: '1em 0',
         padding: 0,
         boxSizing: 'border-box',
         minWidth: '100%',
         // Reserve space based on estimated size to prevent layout shifts
-        ...(isJointRender ? {
-            minHeight: '400px',
-            maxHeight: '600px',
-            overflow: 'auto'
-        } : isVegaLiteRender ? {
-            // Specific styles for Vega-Lite - ensure full width usage
-            width: '100%',
-        } : {}),
         ...(reservedSize && !hasSuccessfulRenderRef.current ? {
             minHeight: `${reservedSize.height}px`,
             minWidth: `${Math.min(reservedSize.width, 800)}px` // Cap width to prevent horizontal overflow
@@ -946,34 +806,49 @@ ${svgData}`;
             data-render-id={renderIdRef.current}
             data-visualization-type={typeof spec === 'object' && spec?.type ? spec.type : 'unknown'}
         >
-            {isStreaming && !isMarkdownBlockClosed && !hasSuccessfulRenderRef.current ? (
-                <div style={{ textAlign: 'center', padding: '20px', backgroundColor: isDarkMode ? '#1f1f1f' : '#f6f8fa', border: '1px dashed #ccc', borderRadius: '4px' }}>
-                    <p>Waiting for complete {typeof spec === 'object' && spec?.type ? spec.type : 'diagram'} definition...</p>
+            {/* Show raw content during streaming */}
+            {showRawContent && rawContent ? (
+                <div style={{ 
+                    position: 'relative',
+                    backgroundColor: isDarkMode ? '#1f1f1f' : '#f6f8fa',
+                    border: `1px solid ${isDarkMode ? '#303030' : '#e1e4e8'}`,
+                    borderRadius: '6px',
+                    padding: '16px',
+                    margin: '16px 0'
+                }}>
+                    <div style={{
+                        fontSize: '12px',
+                        color: isDarkMode ? '#8b949e' : '#586069',
+                        marginBottom: '8px',
+                        fontWeight: 'bold'
+                    }}>
+                        {typeof spec === 'object' && spec?.type ? `${spec.type.charAt(0).toUpperCase() + spec.type.slice(1)} Specification` : 'Diagram Specification'}
+                    </div>
+                    <pre style={{
+                        margin: 0,
+                        color: isDarkMode ? '#e6e6e6' : '#24292e',
+                        fontSize: '13px',
+                        lineHeight: '1.45',
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
+                        fontFamily: 'Monaco, Menlo, "Ubuntu Mono", monospace'
+                    }}>{rawContent}</pre>
                 </div>
-            ) : (
-                <>
-                    {displayWaitingMessage && (
-                        <div style={{ textAlign: 'center', padding: '20px', backgroundColor: isDarkMode ? '#1f1f1f' : '#f6f8fa', border: '1px dashed #ccc', borderRadius: '4px' }}>
-                            <p>Waiting for complete diagram definition...</p>
-                        </div>
-                    )}
-                </>
-            )}
+            ) : null}
 
             {isD3Render ? (
                 <div
                     ref={d3ContainerRef}
-                    className={`d3-container ${isMermaidRender ? 'mermaid-container' : ''}`}
+                    className={`d3-container ${currentPlugin?.name ? `${currentPlugin.name}-container` : ''}`}
                     style={{
-                        ...containerStyles,
                         width: '100%',
-                        height: isVegaLiteRender ? 'auto' : containerStyles.height,
-                        overflow: isVegaLiteRender ? 'visible' : 'auto',
                         display: 'flex',
                         flexDirection: 'column',
                         alignItems: 'center',
                         position: 'relative',
-                        boxSizing: 'border-box'
+                        boxSizing: 'border-box',
+                        // Apply containerStyles last so they can override defaults
+                        ...containerStyles
                     }}
                 />
             ) : (
@@ -987,27 +862,9 @@ ${svgData}`;
                         maxWidth: '100%',
                         display: !isD3Render ? 'block' : 'none',
                         position: 'relative',
-                        height: isVegaLiteRender ? 'auto' : (height || '100%')
+                        height: height || '100%'
                     }}
                 >
-                    {(isLoading || !spec) && !renderingStarted && (
-                        <div style={{
-                            position: 'absolute',
-                            top: 0,
-                            left: 0,
-                            right: 0,
-                            bottom: 0,
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            backgroundColor: 'rgba(0, 0, 0, 0.1)'
-                        }}>
-                            <Spin size="large" />
-                            <div style={{ marginTop: '10px', color: isDarkMode ? '#ffffff' : '#000000' }}>
-                                Preparing visualization...
-                            </div>
-                        </div>
-                    )}
                     {renderError && !isStreaming && isMarkdownBlockClosed && (
                         <pre style={{
                             padding: '16px',

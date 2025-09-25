@@ -16,6 +16,7 @@ from app.utils.logging_utils import logger
 from app.utils.custom_bedrock import CustomBedrockClient
 import os
 from app.utils.context_cache import get_context_cache_manager
+from app.utils.conversation_context import conversation_context
 
 
 class ZiyaBedrock(Runnable):
@@ -317,7 +318,8 @@ class ZiyaBedrock(Runnable):
         # Ensure system messages are properly ordered after caching
         messages = self._ensure_system_message_ordering(messages)
 
-        kwargs["max_tokens"] = int(os.environ.get("ZIYA_MAX_OUTPUT_TOKENS", self.ziya_max_tokens))  # Use environment variable if available
+        # Use much higher default if not set
+        kwargs["max_tokens"] = int(os.environ.get("ZIYA_MAX_OUTPUT_TOKENS", self.ziya_max_tokens or 32768))
         if self.ziya_max_tokens is not None and "max_tokens" not in kwargs:
             kwargs["max_tokens"] = self.ziya_max_tokens
             logger.debug(f"Added max_tokens={self.ziya_max_tokens} to _generate kwargs")
@@ -499,8 +501,16 @@ class ZiyaBedrock(Runnable):
         
         # Wrap the client with our custom client
         if hasattr(self.bedrock_model, 'client') and self.bedrock_model.client is not None:
-            self.bedrock_model.client = CustomBedrockClient(self.bedrock_model.client, max_tokens=self.ziya_max_tokens)
-            logger.debug(f"Wrapped boto3 client with CustomBedrockClient, max_tokens={self.ziya_max_tokens}")
+            # Get model config for extended context support
+            from app.agents.models import ModelManager
+            model_config = ModelManager.get_model_config('bedrock', ModelManager.get_model_alias())
+            
+            self.bedrock_model.client = CustomBedrockClient(
+                self.bedrock_model.client, 
+                max_tokens=self.ziya_max_tokens,
+                model_config=model_config
+            )
+            logger.debug(f"Wrapped boto3 client with CustomBedrockClient, max_tokens={self.ziya_max_tokens}, model_config keys={list(model_config.keys())}")
         
         return self
     
@@ -769,7 +779,11 @@ class ZiyaBedrock(Runnable):
                 del kwargs["thinking_mode"]
                 
         # Call the underlying model's invoke method
-        return self.bedrock_model.invoke(messages, config, **kwargs)
+        if conversation_id:
+            with conversation_context(conversation_id):
+                return self.bedrock_model.invoke(messages, config, **kwargs)
+        else:
+            return self.bedrock_model.invoke(messages, config, **kwargs)
         
     async def ainvoke(self, input: Any, config: Optional[Dict] = None, **kwargs: Any) -> Any:
         """
@@ -826,7 +840,11 @@ class ZiyaBedrock(Runnable):
                 
         # Call the underlying model's ainvoke method
         try:
-            return await self.bedrock_model.ainvoke(messages, config, **kwargs)
+            if conversation_id:
+                with conversation_context(conversation_id):
+                    return await self.bedrock_model.ainvoke(messages, config, **kwargs)
+            else:
+                return await self.bedrock_model.ainvoke(messages, config, **kwargs)
         except Exception as e:
             logger.error(f"Error in ainvoke: {str(e)}")
             raise
@@ -886,7 +904,11 @@ class ZiyaBedrock(Runnable):
         self.bedrock_model.streaming = True
         
         # Call the underlying model's stream method
-        return self.bedrock_model.stream(messages, config, **kwargs)
+        if conversation_id:
+            with conversation_context(conversation_id):
+                return self.bedrock_model.stream(messages, config, **kwargs)
+        else:
+            return self.bedrock_model.stream(messages, config, **kwargs)
         
     async def astream(self, input: Any, config: Optional[Dict] = None, **kwargs: Any) -> AsyncIterator[Any]:
         """
@@ -916,6 +938,8 @@ class ZiyaBedrock(Runnable):
 
         # Ensure system messages are properly ordered after caching
         messages = self._ensure_system_message_ordering(messages)        
+
+        logger.info(f"ZiyaBedrock.astream called with model_id: {self.model_id}")
 
         # Extract conversation_id from config if not in kwargs
         if not conversation_id and config and isinstance(config, dict):
@@ -948,9 +972,16 @@ class ZiyaBedrock(Runnable):
         # Set streaming to True for this call
         self.bedrock_model.streaming = True
         
-        # Call the underlying model's astream method and properly await it
-        async for chunk in self.bedrock_model.astream(messages, config, **kwargs):
-            yield chunk
+        # Use conversation context if available
+        if conversation_id:
+            with conversation_context(conversation_id):
+                # Call the underlying model's astream method and properly await it
+                async for chunk in self.bedrock_model.astream(messages, config, **kwargs):
+                    yield chunk
+        else:
+            # Call the underlying model's astream method and properly await it
+            async for chunk in self.bedrock_model.astream(messages, config, **kwargs):
+                yield chunk
     # Implement the Runnable protocol
     def transform(self, input: Any) -> Any:
         """Transform input according to Runnable protocol."""

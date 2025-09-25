@@ -2,6 +2,7 @@ import React, { createContext, ReactNode, useContext, useState, useEffect, Dispa
 import { Conversation, Message, ConversationFolder } from "../utils/types";
 import { v4 as uuidv4 } from "uuid";
 import { db } from '../utils/db';
+import { detectIncompleteResponse } from '../utils/responseUtils';
 import { message } from 'antd';
 
 export type ProcessingState = 'idle' | 'sending' | 'awaiting_model_response' | 'processing_tools' | 'awaiting_tool_response' | 'tool_throttling' | 'tool_limit_reached' | 'error';
@@ -16,9 +17,12 @@ interface ConversationProcessingState {
 
 interface ChatContext {
     streamedContentMap: Map<string, string>;
+    reasoningContentMap: Map<string, string>;
     dynamicTitleLength: number;
+    lastResponseIncomplete: boolean;
     setDynamicTitleLength: (length: number) => void;
     setStreamedContentMap: Dispatch<SetStateAction<Map<string, string>>>;
+    setReasoningContentMap: Dispatch<SetStateAction<Map<string, string>>>;
     isStreaming: boolean;
     getProcessingState: (conversationId: string) => ProcessingState;
     updateProcessingState: (conversationId: string, state: ProcessingState) => void;
@@ -69,6 +73,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
     const renderCount = useRef(0);
     const [isStreaming, setIsStreaming] = useState(false);
     const [streamedContentMap, setStreamedContentMap] = useState(() => new Map<string, string>());
+    const [reasoningContentMap, setReasoningContentMap] = useState(() => new Map<string, string>());
     const [isStreamingAny, setIsStreamingAny] = useState(false);
     const [processingStates, setProcessingStates] = useState(() => new Map<string, ConversationProcessingState>());
     const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -77,9 +82,17 @@ export function ChatProvider({ children }: ChatProviderProps) {
     const currentConversationRef = useRef<string>(currentConversationId);
     const [currentMessages, setCurrentMessages] = useState<Message[]>([]);
     const [streamingConversations, setStreamingConversations] = useState<Set<string>>(new Set());
-    const [isTopToBottom, setIsTopToBottom] = useState(false);
+    const [isTopToBottom, setIsTopToBottom] = useState(() => {
+        const saved = localStorage.getItem('ZIYA_TOP_DOWN_MODE');
+        return saved ? JSON.parse(saved) : false;
+    });
     const [isInitialized, setIsInitialized] = useState(false);
     const [userHasScrolled, setUserHasScrolled] = useState(false);
+
+    // Persist top-down mode preference
+    useEffect(() => {
+        localStorage.setItem('ZIYA_TOP_DOWN_MODE', JSON.stringify(isTopToBottom));
+    }, [isTopToBottom]);
     const initializationStarted = useRef(false);
     const [folders, setFolders] = useState<ConversationFolder[]>([]);
     const [dbError, setDbError] = useState<string | null>(null);
@@ -89,6 +102,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
     const [dynamicTitleLength, setDynamicTitleLength] = useState<number>(50); // Default reasonable length
     const processedModelChanges = useRef<Set<string>>(new Set());
     const saveQueue = useRef<Promise<void>>(Promise.resolve());
+    const [lastResponseIncomplete, setLastResponseIncomplete] = useState<boolean>(false);
     const isRecovering = useRef<boolean>(false);
     const messageUpdateCount = useRef(0);
     const conversationsRef = useRef(conversations);
@@ -131,6 +145,13 @@ export function ChatProvider({ children }: ChatProviderProps) {
         setStreamingConversations(prev => {
             const next = new Set(prev);
             next.delete(id);
+            // Update global streaming state based on remaining conversations
+            const stillStreaming = next.size > 0;
+            setIsStreamingAny(stillStreaming);
+            // Only update isStreaming if this was the current conversation
+            if (id === currentConversationId) {
+                setIsStreaming(false);
+            }
             return next;
         });
 
@@ -140,15 +161,9 @@ export function ChatProvider({ children }: ChatProviderProps) {
             return next;
         });
 
-        // Only set isStreamingAny to false if no conversations are streaming
-        setStreamingConversations(prev => {
-            setIsStreamingAny(prev.size > 1);
-            return prev;
-        });
-
         // Auto-reset processing state when streaming ends
         updateProcessingState(id, 'idle');
-    }, [streamingConversations]);
+    }, [streamingConversations, currentConversationId]);
 
     const updateProcessingState = useCallback((conversationId: string, state: ProcessingState) => {
         setProcessingStates(prev => {
@@ -205,6 +220,11 @@ export function ChatProvider({ children }: ChatProviderProps) {
 
         // Debug logging to see when messages are added
         console.log('📝 Adding message:', { role: message.role, conversationId: targetConversationId, titleLength: dynamicTitleLength });
+
+        // Check if this is an assistant message and if it appears incomplete
+        if (message.role === 'assistant' && message.content) {
+            setLastResponseIncomplete(detectIncompleteResponse(message.content));
+        }
 
         messageUpdateCount.current += 1;
         setConversations(prevConversations => {
@@ -333,6 +353,10 @@ export function ChatProvider({ children }: ChatProviderProps) {
 
     const startNewChat = useCallback((specificFolderId?: string | null) => {
         return new Promise<void>((resolve, reject) => {
+            if (!isInitialized) {
+                reject(new Error('Chat context not initialized yet'));
+                return;
+            }
             try {
                 const newId = uuidv4();
 
@@ -373,7 +397,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
                 reject(error);
             }
         });
-    }, [currentConversationId, currentFolderId, conversations, queueSave]);
+    }, [isInitialized, currentConversationId, currentFolderId, conversations, queueSave]);
 
     const loadConversation = useCallback(async (conversationId: string) => {
         setIsLoadingConversation(true);
@@ -584,13 +608,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
         }
     }, [createBackup, currentConversationId]);
 
-    // Load current messages when conversation changes
-    useEffect(() => {
-        if (currentConversationId && isInitialized) {
-            const messages = conversations.find(c => c.id === currentConversationId)?.messages || [];
-            setCurrentMessages(messages);
-        }
-    }, [conversations, currentConversationId, isInitialized]);
+
 
     useEffect(() => {
         initializeWithRecovery();
@@ -655,13 +673,6 @@ export function ChatProvider({ children }: ChatProviderProps) {
     useEffect(() => {
         currentConversationRef.current = currentConversationId;
         folderRef.current = currentFolderId;
-        console.log('Current conversation ref updated:', {
-            id: currentConversationId,
-            streamingConversations: Array.from(streamingConversations),
-            hasStreamingContent: Array.from(streamedContentMap.keys()),
-            activeConversations: conversations.filter(c => c.isActive).map(c => c.id),
-            streamingToOther: streamingConversations.has(currentConversationId)
-        });
     }, [currentConversationId, conversations, currentFolderId, streamedContentMap, streamingConversations]);
 
     const mergeConversations = useCallback((local: Conversation[], remote: Conversation[]) => {
@@ -774,16 +785,33 @@ export function ChatProvider({ children }: ChatProviderProps) {
             }));
             return updated;
         });
-        
+
         // Force currentMessages to update
         setMessageUpdateCounter(prev => prev + 1);
     }, [queueSave]);
 
     const value = useMemo(() => ({
         streamedContentMap,
+        reasoningContentMap,
         dynamicTitleLength,
+        lastResponseIncomplete,
         setDynamicTitleLength,
         setStreamedContentMap,
+        setReasoningContentMap,
+        // Group conversation-specific state to reduce re-renders
+        currentConversationState: {
+            currentMessages,
+            editingMessageIndex,
+            isLoadingConversation,
+            isStreaming: streamingConversations.has(currentConversationId),
+            hasStreamedContent: streamedContentMap.has(currentConversationId),
+        },
+        // Group global state
+        globalState: {
+            conversations,
+            folders,
+            isStreamingAny,
+        },
         getProcessingState,
         updateProcessingState,
         isStreaming,
@@ -823,7 +851,10 @@ export function ChatProvider({ children }: ChatProviderProps) {
         setEditingMessageIndex,
     }), [
         streamedContentMap,
+        currentMessages,
+        editingMessageIndex,
         dynamicTitleLength,
+        lastResponseIncomplete,
         setDynamicTitleLength,
         setStreamedContentMap,
         getProcessingState,
